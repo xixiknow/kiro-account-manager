@@ -25,7 +25,7 @@ tauri-plugin-log = "2"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "signal"], default-features = false }
 axum = "0.8"
 tokio-stream = "0.1"
 futures-util = "0.3"
@@ -65,6 +65,7 @@ tower = { version = "0.5", features = ["util"] }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+server-console = []
 
 # 开发配置：增量编译加速 + 避免编译器崩溃
 [profile.dev]

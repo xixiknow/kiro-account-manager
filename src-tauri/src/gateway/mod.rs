@@ -936,6 +936,16 @@ pub async fn clear_gateway_request_logs(
     clear_gateway_request_logs_at_path(&path)
 }
 
+pub async fn start_gateway_runtime(config: GatewayConfig) -> Result<GatewayRuntime, String> {
+    let config = normalize_config(&config);
+    ensure_config_valid(&config)?;
+    spawn_runtime(config).await
+}
+
+pub async fn stop_gateway_runtime(runtime: &mut GatewayRuntime) {
+    stop_runtime(runtime).await;
+}
+
 pub async fn start_gateway(
     state: &tauri::State<'_, crate::state::AppState>,
     config: GatewayConfig,

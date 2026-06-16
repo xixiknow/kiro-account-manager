@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), not(feature = "server-console")),
+    windows_subsystem = "windows"
+)]
 // 核心模块
 mod core;
 mod state;
@@ -380,8 +383,254 @@ fn setup_window_close_handler(app: &mut tauri::App) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct ServerModeOptions {
+    host: Option<String>,
+    port: Option<u16>,
+    api_key: Option<String>,
+    allowed_ips: Vec<String>,
+    local_only: Option<bool>,
+    show_help: bool,
+}
+
+struct ServerLogger;
+
+static SERVER_LOGGER: ServerLogger = ServerLogger;
+
+impl log::Log for ServerLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level().to_level_filter() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if !record.target().starts_with("kiro_account_manager") && record.level() > log::Level::Warn
+        {
+            return;
+        }
+        eprintln!(
+            "{} {} [{}] {}",
+            chrono::Local::now().format("%H:%M:%S"),
+            record.level(),
+            record
+                .target()
+                .rsplit("::")
+                .next()
+                .unwrap_or(record.target()),
+            record.args()
+        );
+    }
+
+    fn flush(&self) {}
+}
+
+fn server_mode_requested(args: &[String]) -> bool {
+    let explicit = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "server" | "serve" | "--server" | "--serve" | "--headless"
+        )
+    });
+    let from_env = std::env::var("KIRO_ACCOUNT_MANAGER_SERVER")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+
+    explicit || from_env
+}
+
+fn read_server_arg_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+    *index += 1;
+    args.get(*index)
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| format!("{flag} 需要一个值"))
+}
+
+fn parse_server_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("端口必须是 1-65535: {value}"))?;
+    if port == 0 {
+        return Err("端口必须大于 0".to_string());
+    }
+    Ok(port)
+}
+
+fn parse_server_mode_options(args: &[String]) -> Result<Option<ServerModeOptions>, String> {
+    if !server_mode_requested(args) {
+        return Ok(None);
+    }
+
+    let mut options = ServerModeOptions::default();
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "server" | "serve" | "--server" | "--serve" | "--headless" => {}
+            "-h" | "--help" => options.show_help = true,
+            "--host" => options.host = Some(read_server_arg_value(args, &mut index, "--host")?),
+            "--port" => {
+                let value = read_server_arg_value(args, &mut index, "--port")?;
+                options.port = Some(parse_server_port(&value)?);
+            }
+            "--api-key" | "--client-api-key" => {
+                options.api_key = Some(read_server_arg_value(args, &mut index, arg)?);
+            }
+            "--allow-ip" | "--allowed-ip" => {
+                options
+                    .allowed_ips
+                    .push(read_server_arg_value(args, &mut index, arg)?);
+            }
+            "--remote" => options.local_only = Some(false),
+            "--local-only" => options.local_only = Some(true),
+            value if value.starts_with("--host=") => {
+                options.host = Some(value["--host=".len()..].to_string());
+            }
+            value if value.starts_with("--port=") => {
+                options.port = Some(parse_server_port(&value["--port=".len()..])?);
+            }
+            value if value.starts_with("--api-key=") => {
+                options.api_key = Some(value["--api-key=".len()..].to_string());
+            }
+            value if value.starts_with("--client-api-key=") => {
+                options.api_key = Some(value["--client-api-key=".len()..].to_string());
+            }
+            value if value.starts_with("--allow-ip=") => {
+                options
+                    .allowed_ips
+                    .push(value["--allow-ip=".len()..].to_string());
+            }
+            value if value.starts_with("--allowed-ip=") => {
+                options
+                    .allowed_ips
+                    .push(value["--allowed-ip=".len()..].to_string());
+            }
+            value if value.starts_with("kiro-account-manager://") => {}
+            value => return Err(format!("未知 server 参数: {value}")),
+        }
+        index += 1;
+    }
+
+    Ok(Some(options))
+}
+
+fn print_server_mode_help() {
+    println!(
+        "Kiro Account Manager server mode\n\
+         Usage: kiro-account-manager server [options]\n\n\
+         Options:\n\
+           --host <host>              覆盖监听地址，例如 0.0.0.0\n\
+           --port <port>              覆盖监听端口\n\
+           --api-key <key>            覆盖客户端访问 API Key\n\
+           --remote                   允许非本机访问，需要白名单\n\
+           --allow-ip <ip|cidr>       添加远程访问白名单，可重复\n\
+           --local-only               只允许本机访问\n"
+    );
+}
+
+fn setup_server_logger(log_level: &str) {
+    let level = match log_level {
+        "info" => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => log::LevelFilter::Debug,
+    };
+
+    if log::set_logger(&SERVER_LOGGER).is_ok() {
+        log::set_max_level(level);
+    }
+}
+
+fn apply_server_mode_options(config: &mut gateway::GatewayConfig, options: &ServerModeOptions) {
+    config.enabled = true;
+
+    if let Some(host) = options
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.host = host.to_string();
+    }
+    if let Some(port) = options.port {
+        config.port = port;
+    }
+    if let Some(api_key) = options
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.access_token = Some(api_key.to_string());
+        if !config.client_api_keys.iter().any(|key| key == api_key) {
+            config.client_api_keys.insert(0, api_key.to_string());
+        }
+    }
+    if let Some(local_only) = options.local_only {
+        config.local_only = local_only;
+    }
+    for ip in options
+        .allowed_ips
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+    {
+        if !config.allowed_ips.iter().any(|existing| existing == ip) {
+            config.allowed_ips.push(ip.to_string());
+        }
+    }
+}
+
+async fn run_server_mode(options: ServerModeOptions) -> Result<(), String> {
+    if options.show_help {
+        print_server_mode_help();
+        return Ok(());
+    }
+
+    let mut config = gateway::load_gateway_config()?;
+    apply_server_mode_options(&mut config, &options);
+    setup_server_logger(&config.log_level);
+
+    let mut runtime = gateway::start_gateway_runtime(config.clone()).await?;
+    println!(
+        "Kiro Account Manager server is running at http://{}:{}",
+        config.host, config.port
+    );
+    println!("Health: http://{}:{}/health", config.host, config.port);
+    println!("Press Ctrl+C to stop.");
+
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| format!("等待退出信号失败: {e}"))?;
+
+    gateway::stop_gateway_runtime(&mut runtime).await;
+    println!("Kiro Account Manager server stopped.");
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // Tauri 框架要求在 main 中注册所有命令，无法拆分
 fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match parse_server_mode_options(&args) {
+        Ok(Some(options)) => {
+            let runtime =
+                tokio::runtime::Runtime::new().expect("failed to initialize tokio runtime");
+            if let Err(err) = runtime.block_on(run_server_mode(options)) {
+                eprintln!("Kiro Account Manager server failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("Kiro Account Manager server argument error: {err}");
+            std::process::exit(2);
+        }
+    }
+
     tauri::Builder::default()
         .plugin(setup_log_plugin().build())
         .plugin(tauri_plugin_process::init())
