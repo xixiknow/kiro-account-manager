@@ -1289,6 +1289,7 @@
   "gateway.manageRules": "Manage Rules",
   "gateway.securityAndAdvanced": "Security & Advanced",
   "gateway.cacheTTLSeconds": "Cache TTL (seconds)",
+  "gateway.promptCacheHitPercent": "Prompt Cache Hit %",
   "gateway.thresholdPercent": "Threshold %",
   "gateway.ipWhitelist": "IP Whitelist",
   "gateway.manageKeys": "Manage Keys",

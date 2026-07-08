@@ -12,7 +12,7 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5 * 60); // 5 分钟
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(60 * 60); // 1 小时
 const DEFAULT_MIN_CACHEABLE_TOKENS: usize = 1024;
 const OPUS_MIN_CACHEABLE_TOKENS: usize = 4096;
-const TARGET_STABLE_CACHE_RATIO: f64 = 0.90; // 理想稳态：约 90% 输入来自缓存，余下保留给最新上下文
+pub const DEFAULT_STABLE_CACHE_TARGET_PERCENT: u16 = 90; // 理想稳态：约 90% 输入来自缓存，余下保留给最新上下文
 const MAX_ENTRIES_PER_ACCOUNT: usize = 200;
 
 /// 缓存使用统计
@@ -121,7 +121,18 @@ impl PromptCacheTracker {
     }
 
     /// 计算缓存命中情况
+    #[allow(dead_code)]
     pub fn compute(&self, account_id: &str, profile: &CacheProfile) -> CacheUsage {
+        self.compute_with_target_percent(account_id, profile, DEFAULT_STABLE_CACHE_TARGET_PERCENT)
+    }
+
+    /// 按指定目标百分比计算缓存命中情况
+    pub fn compute_with_target_percent(
+        &self,
+        account_id: &str,
+        profile: &CacheProfile,
+        target_percent: u16,
+    ) -> CacheUsage {
         if profile.breakpoints.is_empty() || account_id.is_empty() {
             return CacheUsage::default();
         }
@@ -153,9 +164,9 @@ impl PromptCacheTracker {
 
         let entries = entries.unwrap();
 
-        // 稳态命中目标：可复用前缀按 90% 折算，最新上下文保持为新写入。
-        let max_cacheable =
-            (profile.total_input_tokens as f64 * TARGET_STABLE_CACHE_RATIO) as usize;
+        // 稳态命中目标：可复用前缀按配置百分比折算，最新上下文保持为新写入。
+        let target_percent = usize::from(target_percent.min(100));
+        let max_cacheable = profile.total_input_tokens.saturating_mul(target_percent) / 100;
         if last_tokens > max_cacheable {
             last_tokens = max_cacheable;
         }
@@ -439,5 +450,26 @@ mod tests {
         let second = tracker.compute("account-a", &profile);
         assert_eq!(second.cache_read_input_tokens, 9_000);
         assert_eq!(second.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn repeated_prompt_honors_custom_target_percent() {
+        let tracker = PromptCacheTracker::new();
+        let system = serde_json::Value::String("a".repeat(40_000));
+        let profile = tracker
+            .build_profile(
+                Some(&system),
+                &[],
+                None,
+                10_000,
+                "claude-sonnet-4-5-20250929",
+            )
+            .expect("system prompt should be cacheable");
+
+        tracker.update("account-a", &profile);
+
+        let usage = tracker.compute_with_target_percent("account-a", &profile, 75);
+        assert_eq!(usage.cache_read_input_tokens, 7_500);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
     }
 }

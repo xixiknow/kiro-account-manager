@@ -116,10 +116,17 @@ pub struct GatewayConfig {
     /// 响应缓存：TTL（秒）
     #[serde(default = "default_cache_ttl")]
     pub response_cache_ttl: u64,
+    /// Prompt Cache 模拟：稳态缓存命中目标百分比
+    #[serde(default = "default_prompt_cache_target_percent")]
+    pub prompt_cache_target_percent: u16,
 }
 
 fn default_cache_ttl() -> u64 {
     180
+}
+
+fn default_prompt_cache_target_percent() -> u16 {
+    prompt_cache::DEFAULT_STABLE_CACHE_TARGET_PERCENT
 }
 
 /// 自定义提示过滤规则
@@ -451,6 +458,7 @@ impl Default for GatewayConfig {
             log_requests: true,
             response_cache_enabled: true,
             response_cache_ttl: default_cache_ttl(),
+            prompt_cache_target_percent: default_prompt_cache_target_percent(),
         }
     }
 }
@@ -532,6 +540,11 @@ fn ensure_config_valid(config: &GatewayConfig) -> Result<(), String> {
             return Err("group 模式必须选择分组".to_string());
         }
         "pool" if config.pool_account_ids.is_empty() => {
+            #[cfg(feature = "server")]
+            {
+                // Server mode must be able to boot the admin UI before accounts are imported.
+            }
+            #[cfg(not(feature = "server"))]
             return Err("pool 模式必须至少选择一个账号".to_string());
         }
         "single" | "group" | "pool" => {}
@@ -556,6 +569,9 @@ fn ensure_config_valid(config: &GatewayConfig) -> Result<(), String> {
         if !is_valid_allowlist_entry(entry) {
             return Err(format!("白名单条目无效: {entry}"));
         }
+    }
+    if config.prompt_cache_target_percent > 100 {
+        return Err("promptCacheTargetPercent 必须在 0-100 之间".to_string());
     }
     Ok(())
 }
@@ -664,6 +680,13 @@ fn clear_gateway_request_logs_at_path(path: &Path) -> Result<(), String> {
 }
 
 fn gateway_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("KAM_DATA_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
     dirs::data_dir()
         .unwrap_or_else(|| {
             let home = std::env::var("USERPROFILE")
@@ -1086,7 +1109,7 @@ async fn spawn_runtime(config: GatewayConfig) -> Result<GatewayRuntime, String> 
         summary_cache_max_age_seconds: config.response_cache_ttl,
         ..response_cache::CacheConfig::default()
     };
-    let cache_dir = dirs::data_dir().map(|p| p.join(".kiro-account-manager").join("cache"));
+    let cache_dir = Some(gateway_data_dir().join("cache"));
     let response_cache = Arc::new(AsyncMutex::new(response_cache::ResponseCache::new(
         cache_config,
         cache_dir,
@@ -1105,6 +1128,16 @@ async fn spawn_runtime(config: GatewayConfig) -> Result<GatewayRuntime, String> 
     };
 
     let app = router(state);
+    #[cfg(feature = "server")]
+    let app = {
+        let admin_state = crate::server_admin::AdminState::from_runtime(
+            config.clone(),
+            request_count.clone(),
+            last_error.clone(),
+            log_store.clone(),
+        )?;
+        app.merge(crate::server_admin::router(admin_state))
+    };
     let addr = build_bind_addr(&config.host, config.port)?;
 
     let listener = TcpListener::bind(addr)
@@ -1503,6 +1536,23 @@ mod tests {
             config.region = region.to_string();
             ensure_config_valid(&config).expect("known region should pass validation");
         }
+    }
+
+    #[test]
+    fn rejects_prompt_cache_target_percent_above_one_hundred() {
+        let config = GatewayConfig {
+            account_mode: "single".to_string(),
+            account_id: Some("test-account".to_string()),
+            access_token: Some("sk-test".to_string()),
+            prompt_cache_target_percent: 101,
+            ..GatewayConfig::default()
+        };
+
+        let err = ensure_config_valid(&config).expect_err("invalid cache target should fail");
+        assert!(
+            err.contains("promptCacheTargetPercent"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

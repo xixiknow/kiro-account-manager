@@ -3,6 +3,24 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+fn app_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("KAM_DATA_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    dirs::data_dir()
+        .unwrap_or_else(|| {
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home)
+        })
+        .join(".kiro-account-manager")
+}
+
 // 自定义反序列化：处理 tag_links 的 null 值
 fn deserialize_tag_links<'de, D>(deserializer: D) -> Result<Vec<AccountTagLink>, D::Error>
 where
@@ -571,13 +589,7 @@ impl AccountStore {
     }
 
     fn get_storage_path() -> PathBuf {
-        let data_dir = dirs::data_dir().unwrap_or_else(|| {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home)
-        });
-        data_dir.join(".kiro-account-manager").join("accounts.json")
+        app_data_dir().join("accounts.json")
     }
 
     fn backup_path_for(path: &PathBuf) -> PathBuf {
@@ -872,15 +884,7 @@ impl GroupTagStore {
     }
 
     fn get_storage_path() -> PathBuf {
-        let data_dir = dirs::data_dir().unwrap_or_else(|| {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home)
-        });
-        data_dir
-            .join(".kiro-account-manager")
-            .join("groups-tags.json")
+        app_data_dir().join("groups-tags.json")
     }
 
     fn load_from_file(path: &PathBuf) -> GroupTagData {

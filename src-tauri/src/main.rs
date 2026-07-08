@@ -15,6 +15,10 @@ mod gateway;
 mod kiro;
 mod model_lock;
 mod models;
+#[cfg(feature = "server")]
+mod server_admin;
+#[cfg(feature = "server")]
+mod server_web;
 mod services;
 mod tasks; // 后台任务模块
 mod utils;
@@ -390,6 +394,7 @@ struct ServerModeOptions {
     api_key: Option<String>,
     allowed_ips: Vec<String>,
     local_only: Option<bool>,
+    prompt_cache_target_percent: Option<u16>,
     show_help: bool,
 }
 
@@ -459,6 +464,16 @@ fn parse_server_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+fn parse_server_percent(value: &str, flag: &str) -> Result<u16, String> {
+    let percent = value
+        .parse::<u16>()
+        .map_err(|_| format!("{flag} 必须是 0-100 的整数: {value}"))?;
+    if percent > 100 {
+        return Err(format!("{flag} 必须在 0-100 之间: {value}"));
+    }
+    Ok(percent)
+}
+
 fn parse_server_mode_options(args: &[String]) -> Result<Option<ServerModeOptions>, String> {
     if !server_mode_requested(args) {
         return Ok(None);
@@ -484,6 +499,12 @@ fn parse_server_mode_options(args: &[String]) -> Result<Option<ServerModeOptions
                     .allowed_ips
                     .push(read_server_arg_value(args, &mut index, arg)?);
             }
+            "--prompt-cache-hit-percent"
+            | "--prompt-cache-target-percent"
+            | "--prompt-cache-hit" => {
+                let value = read_server_arg_value(args, &mut index, arg)?;
+                options.prompt_cache_target_percent = Some(parse_server_percent(&value, arg)?);
+            }
             "--remote" => options.local_only = Some(false),
             "--local-only" => options.local_only = Some(true),
             value if value.starts_with("--host=") => {
@@ -508,6 +529,24 @@ fn parse_server_mode_options(args: &[String]) -> Result<Option<ServerModeOptions
                     .allowed_ips
                     .push(value["--allowed-ip=".len()..].to_string());
             }
+            value if value.starts_with("--prompt-cache-hit-percent=") => {
+                options.prompt_cache_target_percent = Some(parse_server_percent(
+                    &value["--prompt-cache-hit-percent=".len()..],
+                    "--prompt-cache-hit-percent",
+                )?);
+            }
+            value if value.starts_with("--prompt-cache-target-percent=") => {
+                options.prompt_cache_target_percent = Some(parse_server_percent(
+                    &value["--prompt-cache-target-percent=".len()..],
+                    "--prompt-cache-target-percent",
+                )?);
+            }
+            value if value.starts_with("--prompt-cache-hit=") => {
+                options.prompt_cache_target_percent = Some(parse_server_percent(
+                    &value["--prompt-cache-hit=".len()..],
+                    "--prompt-cache-hit",
+                )?);
+            }
             value if value.starts_with("kiro-account-manager://") => {}
             value => return Err(format!("未知 server 参数: {value}")),
         }
@@ -527,6 +566,8 @@ fn print_server_mode_help() {
            --api-key <key>            覆盖客户端访问 API Key\n\
            --remote                   允许非本机访问，需要白名单\n\
            --allow-ip <ip|cidr>       添加远程访问白名单，可重复\n\
+           --prompt-cache-hit-percent <0-100>\n\
+                                      覆盖 Prompt Cache 模拟命中率\n\
            --local-only               只允许本机访问\n"
     );
 }
@@ -571,6 +612,9 @@ fn apply_server_mode_options(config: &mut gateway::GatewayConfig, options: &Serv
     }
     if let Some(local_only) = options.local_only {
         config.local_only = local_only;
+    }
+    if let Some(percent) = options.prompt_cache_target_percent {
+        config.prompt_cache_target_percent = percent;
     }
     for ip in options
         .allowed_ips

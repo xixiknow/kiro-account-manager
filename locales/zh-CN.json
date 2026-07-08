@@ -1245,6 +1245,7 @@
   "gateway.manageRules": "管理规则",
   "gateway.securityAndAdvanced": "安全与高级",
   "gateway.cacheTTLSeconds": "缓存TTL(秒)",
+  "gateway.promptCacheHitPercent": "Prompt Cache命中率%",
   "gateway.thresholdPercent": "阈值%",
   "gateway.ipWhitelist": "IP 白名单",
   "gateway.manageKeys": "管理 Keys",

@@ -66,6 +66,7 @@ tower = { version = "0.5", features = ["util"] }
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 server-console = []
+server = []
 
 # 开发配置：增量编译加速 + 避免编译器崩溃
 [profile.dev]

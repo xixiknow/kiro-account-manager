@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kiro Account Manager</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #111416;
+        --panel: #191f22;
+        --panel-2: #20282c;
+        --line: #334047;
+        --text: #edf2f4;
+        --muted: #9fb0b8;
+        --accent: #4fb477;
+        --accent-2: #4aa3df;
+        --danger: #ef6b6b;
+        --warning: #f2b84b;
+        --radius: 8px;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "Microsoft YaHei", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      button,
+      input,
+      textarea,
+      select {
+        font: inherit;
+      }
+
+      button {
+        min-height: 36px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--panel-2);
+        color: var(--text);
+        padding: 0 12px;
+        cursor: pointer;
+      }
+
+      button:hover {
+        border-color: var(--accent-2);
+      }
+
+      button.primary {
+        border-color: transparent;
+        background: var(--accent);
+        color: #08110d;
+        font-weight: 700;
+      }
+
+      button.danger {
+        border-color: rgba(239, 107, 107, 0.45);
+        color: #ffd4d4;
+      }
+
+      input,
+      textarea {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #0d1011;
+        color: var(--text);
+        padding: 9px 10px;
+      }
+
+      textarea {
+        min-height: 96px;
+        resize: vertical;
+        line-height: 1.45;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      code {
+        color: #b9e8cc;
+      }
+
+      .shell {
+        width: min(1280px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 28px 0 48px;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 22px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .mark {
+        width: 36px;
+        height: 36px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        background: linear-gradient(135deg, var(--accent), var(--accent-2));
+        color: #07100c;
+        font-weight: 900;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        letter-spacing: 0;
+      }
+
+      .subtle {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+        gap: 16px;
+        align-items: start;
+      }
+
+      .stack {
+        display: grid;
+        gap: 16px;
+      }
+
+      .panel {
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--panel);
+      }
+
+      .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .panel-title {
+        margin: 0;
+        font-size: 15px;
+      }
+
+      .panel-body {
+        padding: 16px;
+      }
+
+      .row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .metric {
+        min-height: 84px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #121719;
+        padding: 12px;
+      }
+
+      .metric .value {
+        margin-top: 8px;
+        font-size: 24px;
+        font-weight: 800;
+      }
+
+      .status-dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--danger);
+        display: inline-block;
+      }
+
+      .status-dot.ok {
+        background: var(--accent);
+      }
+
+      .table-wrap {
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        min-width: 620px;
+      }
+
+      th,
+      td {
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        font-size: 13px;
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--muted);
+        font-weight: 600;
+        background: #151b1e;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .toast {
+        position: fixed;
+        right: 18px;
+        bottom: 18px;
+        max-width: min(420px, calc(100vw - 36px));
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #0d1011;
+        color: var(--text);
+        padding: 12px 14px;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+        display: none;
+      }
+
+      .login {
+        width: min(420px, calc(100vw - 32px));
+        margin: 12vh auto 0;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      @media (max-width: 920px) {
+        .grid,
+        .form-grid,
+        .metric-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main id="login" class="login panel">
+      <div class="panel-header">
+        <div class="brand">
+          <div class="mark">K</div>
+          <div>
+            <h1>Kiro Account Manager</h1>
+            <div class="subtle">Server Admin</div>
+          </div>
+        </div>
+      </div>
+      <div class="panel-body stack">
+        <label>
+          Admin Token
+          <input id="token" type="password" autocomplete="current-password" />
+        </label>
+        <button id="loginBtn" class="primary">登录</button>
+      </div>
+    </main>
+
+    <main id="app" class="shell hidden">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark">K</div>
+          <div>
+            <h1>Kiro Account Manager</h1>
+            <div class="subtle"><span id="statusDot" class="status-dot"></span> <span id="runtimeLine">Loading</span></div>
+          </div>
+        </div>
+        <div class="row">
+          <button id="refreshBtn">刷新</button>
+          <button id="logoutBtn">退出</button>
+        </div>
+      </header>
+
+      <section class="grid">
+        <div class="stack">
+          <section class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">运行状态</h2>
+              <span id="version" class="subtle"></span>
+            </div>
+            <div class="panel-body">
+              <div class="metric-grid">
+                <div class="metric"><div class="subtle">请求数</div><div id="mRequests" class="value">0</div></div>
+                <div class="metric"><div class="subtle">成功</div><div id="mSuccess" class="value">0</div></div>
+                <div class="metric"><div class="subtle">错误</div><div id="mError" class="value">0</div></div>
+                <div class="metric"><div class="subtle">缓存读取 tokens</div><div id="mCacheRead" class="value">0</div></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Gateway 配置</h2>
+              <div class="row">
+                <button id="saveConfigBtn" class="primary">保存</button>
+                <button id="startBtn">应用</button>
+                <button id="stopBtn" class="danger">停止</button>
+              </div>
+            </div>
+            <div class="panel-body stack">
+              <div class="form-grid">
+                <label>Host <input id="cfgHost" /></label>
+                <label>Port <input id="cfgPort" type="number" min="1" max="65535" /></label>
+                <label>Region <input id="cfgRegion" /></label>
+                <label>策略 <input id="cfgStrategy" /></label>
+                <label>阈值 <input id="cfgThreshold" type="number" min="0" max="100" /></label>
+                <label>Prompt Cache 目标 % <input id="cfgPromptCache" type="number" min="0" max="100" /></label>
+              </div>
+              <label>Client API Keys<textarea id="cfgApiKeys" spellcheck="false"></textarea></label>
+              <label>Allowed IPs<textarea id="cfgAllowedIps" spellcheck="false"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">请求日志</h2>
+              <button id="loadLogsBtn">刷新日志</button>
+            </div>
+            <div class="panel-body">
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>端点</th>
+                      <th>模型</th>
+                      <th>状态</th>
+                      <th>耗时</th>
+                    </tr>
+                  </thead>
+                  <tbody id="logsBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <aside class="stack">
+          <section class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">Prompt Cache</h2>
+              <button id="saveCacheBtn" class="primary">保存</button>
+            </div>
+            <div class="panel-body stack">
+              <label>目标命中率 <input id="cachePercent" type="number" min="0" max="100" /></label>
+              <div class="subtle">当前配置会在下一次服务重启后完整应用到运行态。</div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">账号</h2>
+              <button id="loadAccountsBtn">刷新账号</button>
+            </div>
+            <div class="panel-body stack">
+              <div class="row">
+                <span class="subtle">总数：</span>
+                <strong id="accountCount">0</strong>
+              </div>
+              <label>导入 JSON<textarea id="importJson" spellcheck="false"></textarea></label>
+              <button id="importBtn" class="primary">导入</button>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Label</th>
+                      <th>Provider</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="accountsBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <div id="toast" class="toast"></div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      let gatewayConfig = null;
+
+      const toast = (message, error = false) => {
+        const node = $("toast");
+        node.textContent = message;
+        node.style.borderColor = error ? "rgba(239,107,107,.7)" : "rgba(79,180,119,.7)";
+        node.style.display = "block";
+        clearTimeout(window.__toastTimer);
+        window.__toastTimer = setTimeout(() => {
+          node.style.display = "none";
+        }, 4200);
+      };
+
+      const escapeHtml = (value) =>
+        String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+
+      async function api(path, options = {}) {
+        const response = await fetch(path, {
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json",
+            ...(options.headers || {}),
+          },
+          ...options,
+        });
+        if (response.status === 401) {
+          showLogin();
+          throw new Error("未登录或登录已过期");
+        }
+        const text = await response.text();
+        const data = text ? JSON.parse(text) : null;
+        if (!response.ok) {
+          throw new Error(data?.error || response.statusText);
+        }
+        return data;
+      }
+
+      function showLogin() {
+        $("login").classList.remove("hidden");
+        $("app").classList.add("hidden");
+      }
+
+      function showApp() {
+        $("login").classList.add("hidden");
+        $("app").classList.remove("hidden");
+      }
+
+      function renderStatus(data) {
+        $("version").textContent = `v${data.version}`;
+        $("runtimeLine").textContent = `${data.gateway.host}:${data.gateway.port}`;
+        $("statusDot").classList.toggle("ok", data.gateway.running);
+        $("mRequests").textContent = data.stats.total;
+        $("mSuccess").textContent = data.stats.success;
+        $("mError").textContent = data.stats.error;
+        $("mCacheRead").textContent = data.stats.totalCacheReadTokens;
+      }
+
+      function fillConfig(config) {
+        gatewayConfig = config;
+        $("cfgHost").value = config.host || "0.0.0.0";
+        $("cfgPort").value = config.port || 8765;
+        $("cfgRegion").value = config.region || "us-east-1";
+        $("cfgStrategy").value = config.strategy || "round_robin";
+        $("cfgThreshold").value = config.threshold ?? 90;
+        $("cfgPromptCache").value = config.promptCacheTargetPercent ?? 90;
+        $("cfgApiKeys").value = (config.clientApiKeys || []).join("\n");
+        $("cfgAllowedIps").value = (config.allowedIps || []).join("\n");
+        $("cachePercent").value = config.promptCacheTargetPercent ?? 90;
+      }
+
+      function collectConfig() {
+        const config = { ...(gatewayConfig || {}) };
+        config.enabled = true;
+        config.host = $("cfgHost").value.trim() || "0.0.0.0";
+        config.port = Number($("cfgPort").value || 8765);
+        config.region = $("cfgRegion").value.trim() || "us-east-1";
+        config.strategy = $("cfgStrategy").value.trim() || "round_robin";
+        config.threshold = Number($("cfgThreshold").value || 90);
+        config.promptCacheTargetPercent = Number($("cfgPromptCache").value || 90);
+        config.clientApiKeys = $("cfgApiKeys").value.split(/\n|,/).map((v) => v.trim()).filter(Boolean);
+        config.accessToken = config.clientApiKeys[0] || null;
+        config.allowedIps = $("cfgAllowedIps").value.split(/\n|,/).map((v) => v.trim()).filter(Boolean);
+        config.localOnly = false;
+        return config;
+      }
+
+      function renderAccounts(accounts) {
+        $("accountCount").textContent = accounts.length;
+        $("accountsBody").innerHTML = accounts
+          .slice(0, 80)
+          .map((account) => `
+            <tr>
+              <td>${escapeHtml(account.label || account.email || account.userId || account.id)}</td>
+              <td>${escapeHtml(account.provider || account.authMethod || "")}</td>
+              <td>${escapeHtml(account.status || "")}</td>
+            </tr>`)
+          .join("");
+      }
+
+      function renderLogs(logs) {
+        $("logsBody").innerHTML = logs
+          .map((entry) => `
+            <tr>
+              <td>${escapeHtml(entry.occurredAt)}</td>
+              <td>${escapeHtml(entry.endpoint)}</td>
+              <td>${escapeHtml(entry.model || "")}</td>
+              <td>${escapeHtml(entry.statusCode)} ${escapeHtml(entry.outcome)}</td>
+              <td>${escapeHtml(entry.durationMs)}ms</td>
+            </tr>`)
+          .join("");
+      }
+
+      async function refreshAll() {
+        const [status, config, accounts, logs] = await Promise.all([
+          api("/admin/api/status"),
+          api("/admin/api/gateway/config"),
+          api("/admin/api/accounts"),
+          api("/admin/api/logs?limit=80"),
+        ]);
+        showApp();
+        renderStatus(status);
+        fillConfig(config);
+        renderAccounts(accounts);
+        renderLogs(logs);
+      }
+
+      $("loginBtn").addEventListener("click", async () => {
+        try {
+          await api("/admin/api/auth/login", {
+            method: "POST",
+            body: JSON.stringify({ token: $("token").value }),
+          });
+          $("token").value = "";
+          await refreshAll();
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+
+      $("logoutBtn").addEventListener("click", async () => {
+        await api("/admin/api/auth/logout", { method: "POST" }).catch(() => null);
+        showLogin();
+      });
+
+      $("refreshBtn").addEventListener("click", () => refreshAll().catch((error) => toast(error.message, true)));
+      $("loadAccountsBtn").addEventListener("click", () => api("/admin/api/accounts").then(renderAccounts).catch((error) => toast(error.message, true)));
+      $("loadLogsBtn").addEventListener("click", () => api("/admin/api/logs?limit=120").then(renderLogs).catch((error) => toast(error.message, true)));
+
+      $("saveConfigBtn").addEventListener("click", async () => {
+        try {
+          const saved = collectConfig();
+          await api("/admin/api/gateway/config", { method: "PUT", body: JSON.stringify(saved) });
+          gatewayConfig = saved;
+          toast("配置已保存");
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+
+      $("startBtn").addEventListener("click", async () => {
+        try {
+          await api("/admin/api/gateway/start", { method: "POST", body: JSON.stringify(collectConfig()) });
+          toast("配置已提交");
+          await refreshAll();
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+
+      $("stopBtn").addEventListener("click", async () => {
+        try {
+          const result = await api("/admin/api/gateway/stop", { method: "POST" });
+          toast(result.message || "已提交");
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+
+      $("saveCacheBtn").addEventListener("click", async () => {
+        try {
+          const value = Number($("cachePercent").value || 90);
+          await api("/admin/api/prompt-cache", {
+            method: "PUT",
+            body: JSON.stringify({ promptCacheTargetPercent: value }),
+          });
+          $("cfgPromptCache").value = value;
+          toast("Prompt Cache 已保存");
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+
+      $("importBtn").addEventListener("click", async () => {
+        try {
+          const raw = $("importJson").value.trim();
+          if (!raw) return toast("导入内容为空", true);
+          const parsed = JSON.parse(raw);
+          const result = await api("/admin/api/accounts/import", {
+            method: "POST",
+            body: JSON.stringify(Array.isArray(parsed) ? parsed : { accounts: parsed }),
+          });
+          toast(`已导入 ${result.imported} 个账号`);
+          $("importJson").value = "";
+          renderAccounts(await api("/admin/api/accounts"));
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+
+      refreshAll().catch(() => showLogin());
+    </script>
+  </body>
+</html>

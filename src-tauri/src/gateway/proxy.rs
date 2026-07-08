@@ -2276,7 +2276,11 @@ pub async fn proxy_handler(
             aggregated.input_tokens as usize,
             &request.model,
         ) {
-            let cache_usage = tracker.compute(&request.model, &profile);
+            let cache_usage = tracker.compute_with_target_percent(
+                &request.model,
+                &profile,
+                state.config.prompt_cache_target_percent,
+            );
             tracker.update(&request.model, &profile);
 
             if cache_usage.cache_read_input_tokens > 0 {
@@ -2289,9 +2293,10 @@ pub async fn proxy_handler(
             }
 
             log::info!(
-                "[非流式] Prompt Cache 模拟: read={}, creation={}",
+                "[非流式] Prompt Cache 模拟: read={}, creation={}, target={}%",
                 cache_usage.cache_read_input_tokens,
-                cache_usage.cache_creation_input_tokens
+                cache_usage.cache_creation_input_tokens,
+                state.config.prompt_cache_target_percent
             );
         }
     }
@@ -4494,7 +4499,11 @@ fn stream_proxy_response(
                 &model,
             ) {
                 let account_id = model.as_str();
-                let cache_usage = tracker.compute(account_id, &profile);
+                let cache_usage = tracker.compute_with_target_percent(
+                    account_id,
+                    &profile,
+                    state.config.prompt_cache_target_percent,
+                );
                 tracker.update(account_id, &profile);
 
                 if cache_usage.cache_read_input_tokens > 0 {
@@ -4507,9 +4516,10 @@ fn stream_proxy_response(
                 }
 
                 log::info!(
-                    "[流式] Prompt Cache 模拟: read={}, creation={}",
+                    "[流式] Prompt Cache 模拟: read={}, creation={}, target={}%",
                     cache_usage.cache_read_input_tokens,
-                    cache_usage.cache_creation_input_tokens
+                    cache_usage.cache_creation_input_tokens,
+                    state.config.prompt_cache_target_percent
                 );
             }
         }

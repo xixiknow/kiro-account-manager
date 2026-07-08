@@ -25,6 +25,7 @@ export interface GatewayConfig {
   logRequests: boolean;
   responseCacheEnabled: boolean;
   responseCacheTtl: number;
+  promptCacheTargetPercent: number;
 }
 
 export interface ModelMappingRule {
@@ -55,6 +56,14 @@ export interface GatewayStatus {
   runtimeConfig: GatewayConfig | null;
 }
 
+const normalizePromptCacheTargetPercent = (value: unknown) => {
+  const percent = Number(value)
+  if (!Number.isFinite(percent)) {
+    return 90
+  }
+  return Math.min(100, Math.max(0, Math.round(percent)))
+}
+
 export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   enabled: false,
   host: '127.0.0.1',
@@ -78,7 +87,8 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   promptFilterRules: [],
   logRequests: true,
   responseCacheEnabled: true,
-  responseCacheTtl: 180
+  responseCacheTtl: 180,
+  promptCacheTargetPercent: 90
 }
 
 export const DEFAULT_GATEWAY_STATUS: GatewayStatus = {
@@ -110,7 +120,11 @@ export const buildGatewayConfigSnapshot = (config: GatewayConfig) => JSON.string
   filterClaudeCode: !!config.filterClaudeCode,
   filterStripBoundaries: !!config.filterStripBoundaries,
   filterEnvNoise: !!config.filterEnvNoise,
-  promptFilterRules: config.promptFilterRules || []
+  promptFilterRules: config.promptFilterRules || [],
+  logRequests: config.logRequests !== false,
+  responseCacheEnabled: !!config.responseCacheEnabled,
+  responseCacheTtl: Number(config.responseCacheTtl) || 180,
+  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent)
 })
 
 export const buildGatewayRuntimeSnapshot = (config: GatewayConfig) => JSON.stringify({
@@ -132,7 +146,11 @@ export const buildGatewayRuntimeSnapshot = (config: GatewayConfig) => JSON.strin
   filterClaudeCode: !!config.filterClaudeCode,
   filterStripBoundaries: !!config.filterStripBoundaries,
   filterEnvNoise: !!config.filterEnvNoise,
-  promptFilterRules: config.promptFilterRules || []
+  promptFilterRules: config.promptFilterRules || [],
+  logRequests: config.logRequests !== false,
+  responseCacheEnabled: !!config.responseCacheEnabled,
+  responseCacheTtl: Number(config.responseCacheTtl) || 180,
+  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent)
 })
 
 export const hydrateGatewayConfig = (gatewayConfig: any): GatewayConfig => ({
@@ -169,7 +187,8 @@ export const hydrateGatewayConfig = (gatewayConfig: any): GatewayConfig => ({
   promptFilterRules: Array.isArray(gatewayConfig?.promptFilterRules) ? gatewayConfig.promptFilterRules : [],
   logRequests: gatewayConfig?.logRequests ?? true,
   responseCacheEnabled: gatewayConfig?.responseCacheEnabled ?? true,
-  responseCacheTtl: gatewayConfig?.responseCacheTtl ?? 180
+  responseCacheTtl: gatewayConfig?.responseCacheTtl ?? 180,
+  promptCacheTargetPercent: normalizePromptCacheTargetPercent(gatewayConfig?.promptCacheTargetPercent)
 })
 
 export const buildGatewayStatusState = (gatewayStatus: any, gatewayConfig: any, fallbackConfig: GatewayConfig = DEFAULT_GATEWAY_CONFIG): GatewayStatus => ({
@@ -208,7 +227,8 @@ export const buildGatewayPayload = (config: GatewayConfig) => ({
   promptFilterRules: config.promptFilterRules || [],
   logRequests: config.logRequests !== false,
   responseCacheEnabled: !!config.responseCacheEnabled,
-  responseCacheTtl: Number(config.responseCacheTtl) || 3600
+  responseCacheTtl: Number(config.responseCacheTtl) || 3600,
+  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent)
 })
 
 export const loadGatewayPageData = async () => {

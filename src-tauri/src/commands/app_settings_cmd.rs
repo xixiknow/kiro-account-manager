@@ -127,6 +127,13 @@ impl AppSettings {
 }
 
 fn get_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("KAM_DATA_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
     dirs::data_dir()
         .unwrap_or_else(|| {
             let home = std::env::var("USERPROFILE")

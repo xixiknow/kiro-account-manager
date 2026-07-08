@@ -369,6 +369,17 @@ function GatewayConfig({
                   />
                 </div>
                 <div className="flex flex-col gap-0.5 p-2.5 rounded-lg border border-border bg-muted/30">
+                  <Label className="text-xs text-muted-foreground">{t('gateway.promptCacheHitPercent')}</Label>
+                  <Input
+                    type="number"
+                    value={config.promptCacheTargetPercent}
+                    min={0}
+                    max={100}
+                    className="h-6 text-sm px-1.5"
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setField('promptCacheTargetPercent', Number(e.target.value))}
+                  />
+                </div>
+                <div className="flex flex-col gap-0.5 p-2.5 rounded-lg border border-border bg-muted/30">
                   <Label className="text-xs text-muted-foreground">{t('gateway.thresholdPercent')}</Label>
                   <Input
                     type="number"
