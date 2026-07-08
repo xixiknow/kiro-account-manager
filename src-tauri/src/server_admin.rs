@@ -18,8 +18,11 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
-    core::account::AccountStore,
+    commands::app_settings_cmd::{self, AppSettings},
+    commands::kiro_settings_cmd,
+    core::account::{AccountStore, GroupTagData, GroupTagStore},
     gateway::{self, log_store, GatewayConfig, GatewayRequestLogEntry, GatewayStatus},
+    services::session_storage::SessionStorage,
 };
 
 const ADMIN_TOKEN_ENV: &str = "KAM_ADMIN_TOKEN";
@@ -35,6 +38,7 @@ pub struct AdminState {
     last_error: Arc<AsyncMutex<Option<String>>>,
     log_store: Arc<log_store::LogStore>,
     accounts: Arc<Mutex<AccountStore>>,
+    group_tags: Arc<Mutex<GroupTagStore>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +93,13 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/api/gateway/stop", post(stop_gateway))
         .route("/admin/api/accounts", get(list_accounts))
         .route("/admin/api/accounts/import", post(import_accounts))
+        .route("/admin/api/groups-tags", get(groups_tags))
+        .route("/admin/api/app/settings", get(get_app_settings))
+        .route("/admin/api/app/settings", put(save_app_settings))
+        .route("/admin/api/kiro/settings", get(get_kiro_settings))
+        .route("/admin/api/sessions/workspaces", get(session_workspaces))
+        .route("/admin/api/sessions", get(sessions))
+        .route("/admin/api/about", get(about))
         .route("/admin/api/logs", get(logs))
         .route("/admin/api/prompt-cache", get(get_prompt_cache))
         .route("/admin/api/prompt-cache", put(save_prompt_cache))
@@ -121,6 +132,7 @@ impl AdminState {
             last_error,
             log_store,
             accounts: Arc::new(Mutex::new(AccountStore::new())),
+            group_tags: Arc::new(Mutex::new(GroupTagStore::new())),
         })
     }
 }
@@ -328,6 +340,118 @@ async fn list_accounts(headers: HeaderMap, State(state): State<AdminState>) -> R
     };
 
     Json(store.get_all()).into_response()
+}
+
+async fn groups_tags(headers: HeaderMap, State(state): State<AdminState>) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    let store = match state.group_tags.lock() {
+        Ok(store) => store,
+        Err(_) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "group/tag store lock failed",
+            )
+        }
+    };
+
+    Json(GroupTagData {
+        groups: store.get_groups(),
+        tags: store.get_tags(),
+    })
+    .into_response()
+}
+
+async fn get_app_settings(headers: HeaderMap, State(state): State<AdminState>) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    match app_settings_cmd::get_app_settings_inner() {
+        Ok(settings) => Json(settings).into_response(),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+async fn save_app_settings(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+    Json(settings): Json<AppSettings>,
+) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    match app_settings_cmd::save_settings_to_file(&settings) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn get_kiro_settings(headers: HeaderMap, State(state): State<AdminState>) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    match kiro_settings_cmd::get_kiro_settings().await {
+        Ok(settings) => Json(settings).into_response(),
+        Err(error) => Json(json!({ "unavailable": true, "message": error })).into_response(),
+    }
+}
+
+async fn session_workspaces(headers: HeaderMap, State(state): State<AdminState>) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    match SessionStorage::new().and_then(|storage| storage.list_workspaces()) {
+        Ok(workspaces) => Json(workspaces).into_response(),
+        Err(error) => {
+            Json(json!({ "unavailable": true, "message": error.to_string() })).into_response()
+        }
+    }
+}
+
+async fn sessions(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    let workspace_hash = query
+        .get("workspaceHash")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if workspace_hash.is_empty() {
+        return Json(Vec::<Value>::new()).into_response();
+    }
+
+    match SessionStorage::new().and_then(|storage| storage.list_sessions(workspace_hash)) {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(error) => {
+            Json(json!({ "unavailable": true, "message": error.to_string() })).into_response()
+        }
+    }
+}
+
+async fn about(headers: HeaderMap, State(state): State<AdminState>) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    Json(json!({
+        "name": "Kiro Account Manager",
+        "version": env!("CARGO_PKG_VERSION"),
+        "mode": "server",
+        "image": "ghcr.io/xixiknow/kiro-account-manager",
+        "dataDir": std::env::var("KAM_DATA_DIR").unwrap_or_else(|_| "(default user data dir)".to_string())
+    }))
+    .into_response()
 }
 
 async fn import_accounts(
