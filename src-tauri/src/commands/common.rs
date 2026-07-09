@@ -684,12 +684,74 @@ fn read_non_empty_string_field(
             .map(std::string::ToString::to_string)
     })
 }
+
+fn read_non_empty_string_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+        .and_then(|field| field.as_str())
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(std::string::ToString::to_string)
+}
+
+fn first_non_empty_string_path(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| read_non_empty_string_path(value, path))
+}
+
 /// 从 `usage_data` 中提取 `email` 和 `user_id`
-/// 兼容 `userInfo.email/userInfo.userId` 与顶层 `email/userId`
+/// 兼容 `userInfo.*`、顶层字段以及常见身份嵌套字段。
 pub fn extract_user_info(usage_data: &serde_json::Value) -> (Option<String>, Option<String>) {
-    let email = read_non_empty_string_field(usage_data, &["userInfo", "email"], "email");
-    let user_id = read_non_empty_string_field(usage_data, &["userInfo", "userId"], "userId");
+    let email =
+        read_non_empty_string_field(usage_data, &["userInfo", "email"], "email").or_else(|| {
+            first_non_empty_string_path(
+                usage_data,
+                &[
+                    &["user", "email"],
+                    &["identity", "email"],
+                    &["account", "email"],
+                ],
+            )
+        });
+    let user_id = read_non_empty_string_field(usage_data, &["userInfo", "userId"], "userId")
+        .or_else(|| {
+            first_non_empty_string_path(
+                usage_data,
+                &[
+                    &["user", "id"],
+                    &["user", "userId"],
+                    &["user", "user_id"],
+                    &["identity", "userId"],
+                    &["identity", "user_id"],
+                    &["account", "userId"],
+                    &["account", "user_id"],
+                    &["user_id"],
+                    &["sub"],
+                    &["subject"],
+                ],
+            )
+        });
     (email, user_id)
+}
+
+pub fn extract_user_info_from_jwt(token: &str) -> (Option<String>, Option<String>) {
+    let Some(payload) = token.split('.').nth(1) else {
+        return (None, None);
+    };
+
+    let bytes_result = {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        URL_SAFE_NO_PAD.decode(payload)
+    };
+    let Ok(bytes) = bytes_result else {
+        return (None, None);
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return (None, None);
+    };
+
+    extract_user_info(&value)
 }
 
 /// 查找已存在的账号索引
@@ -718,8 +780,8 @@ pub fn find_existing_account_idx(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_user_info, find_existing_account_idx, parse_usage_result,
-        resolve_kiro_call_context, resolve_profile_arn_from_candidates,
+        extract_user_info, extract_user_info_from_jwt, find_existing_account_idx,
+        parse_usage_result, resolve_kiro_call_context, resolve_profile_arn_from_candidates,
         resolve_profile_arn_with_fallback,
     };
     use super::{is_client_registration_expiring, is_token_expired, is_token_expiring_soon};
@@ -1139,6 +1201,61 @@ mod tests {
             (
                 Some("nested@example.com".to_string()),
                 Some("nested-user".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn extract_user_info_reads_common_identity_fallback_paths() {
+        let usage = serde_json::json!({
+            "user": {
+                "email": " user@example.com ",
+                "id": " user-id "
+            }
+        });
+
+        assert_eq!(
+            extract_user_info(&usage),
+            (
+                Some("user@example.com".to_string()),
+                Some("user-id".to_string())
+            )
+        );
+
+        let usage = serde_json::json!({
+            "identity": {
+                "userId": "identity-user"
+            }
+        });
+
+        assert_eq!(
+            extract_user_info(&usage),
+            (None, Some("identity-user".to_string()))
+        );
+
+        let usage = serde_json::json!({
+            "sub": "subject-user"
+        });
+
+        assert_eq!(
+            extract_user_info(&usage),
+            (None, Some("subject-user".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_user_info_from_jwt_reads_email_and_subject() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"email":"jwt@example.com","user_id":"jwt-user"}"#);
+        let token = format!("{header}.{payload}.sig");
+
+        assert_eq!(
+            extract_user_info_from_jwt(&token),
+            (
+                Some("jwt@example.com".to_string()),
+                Some("jwt-user".to_string())
             )
         );
     }

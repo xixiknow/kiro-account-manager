@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
@@ -27,9 +28,9 @@ use crate::{
     },
     commands::app_settings_cmd::{self, AppSettings},
     commands::common::{
-        calc_expires_at, extract_user_info, find_existing_account_idx, generate_account_machine_id,
-        get_usage_by_provider_with_machine_id, resolve_idc_client_id_hash, save_store,
-        update_account_status, KIRO_BUILDER_ID_START_URL,
+        calc_expires_at, extract_user_info, extract_user_info_from_jwt, find_existing_account_idx,
+        generate_account_machine_id, get_usage_by_provider_with_machine_id,
+        resolve_idc_client_id_hash, save_store, update_account_status, KIRO_BUILDER_ID_START_URL,
     },
     commands::kiro_settings_cmd,
     core::account::{Account, AccountStore, GroupTagData, GroupTagStore},
@@ -367,24 +368,37 @@ fn resolve_idc_region(region: Option<String>) -> String {
         .unwrap_or_else(|| "us-east-1".to_string())
 }
 
+fn idc_refresh_token_fallback_identity(refresh_token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(refresh_token.as_bytes());
+    let digest = hasher.finalize();
+    let prefix = digest[..3]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("kiro_{prefix}")
+}
+
 fn resolve_idc_account_identity(
-    provider: &str,
     email: Option<String>,
     user_id: Option<String>,
     refresh_token: &str,
-) -> Result<String, String> {
-    if provider == "Enterprise" {
-        email
-            .or(user_id)
-            .ok_or_else(|| "IAM Identity Center 账号缺少 userId 或 email".to_string())
-    } else {
-        Ok(email.or(user_id).unwrap_or_else(|| {
-            format!(
-                "builderid_{}",
-                refresh_token.chars().take(8).collect::<String>()
-            )
-        }))
-    }
+) -> String {
+    email
+        .or(user_id)
+        .unwrap_or_else(|| idc_refresh_token_fallback_identity(refresh_token))
+}
+
+fn merge_optional_identity(
+    primary_email: Option<String>,
+    primary_user_id: Option<String>,
+    fallback_email: Option<String>,
+    fallback_user_id: Option<String>,
+) -> (Option<String>, Option<String>) {
+    (
+        primary_email.or(fallback_email),
+        primary_user_id.or(fallback_user_id),
+    )
 }
 
 fn first_forwarded_value(value: &str) -> Option<String> {
@@ -1081,13 +1095,24 @@ async fn finish_idc_device_login(
         return Err("BANNED: 账号已被封禁".to_string());
     }
 
-    let (new_email, user_id) = extract_user_info(&usage_result.usage_data);
+    let (usage_email, usage_user_id) = extract_user_info(&usage_result.usage_data);
+    let jwt_identity = token_response
+        .id_token
+        .as_deref()
+        .map(extract_user_info_from_jwt)
+        .filter(|(email, user_id)| email.is_some() || user_id.is_some())
+        .or_else(|| {
+            let identity = extract_user_info_from_jwt(&token_response.access_token);
+            (identity.0.is_some() || identity.1.is_some()).then_some(identity)
+        })
+        .unwrap_or((None, None));
+    let (new_email, user_id) =
+        merge_optional_identity(usage_email, usage_user_id, jwt_identity.0, jwt_identity.1);
     let display_id = resolve_idc_account_identity(
-        &pending.provider,
         new_email.clone(),
         user_id.clone(),
         &token_response.refresh_token,
-    )?;
+    );
     let account_start_url = if pending.provider == "Enterprise" {
         Some(pending.start_url.clone())
     } else {
@@ -1510,5 +1535,70 @@ async fn save_prompt_cache(
         }))
         .into_response(),
         Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        idc_refresh_token_fallback_identity, merge_optional_identity, resolve_idc_account_identity,
+    };
+    use sha2::{Digest, Sha256};
+
+    fn expected_refresh_token_fallback(refresh_token: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(refresh_token.as_bytes());
+        let digest = hasher.finalize();
+        let prefix = digest[..3]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("kiro_{prefix}")
+    }
+
+    #[test]
+    fn idc_identity_falls_back_to_refresh_token_hash() {
+        let refresh_token = "refresh-token-without-identity";
+
+        assert_eq!(
+            resolve_idc_account_identity(None, None, refresh_token),
+            expected_refresh_token_fallback(refresh_token)
+        );
+        assert_eq!(
+            idc_refresh_token_fallback_identity(refresh_token),
+            expected_refresh_token_fallback(refresh_token)
+        );
+    }
+
+    #[test]
+    fn idc_identity_prefers_email_then_user_id() {
+        assert_eq!(
+            resolve_idc_account_identity(
+                Some("user@example.com".to_string()),
+                Some("user-id".to_string()),
+                "refresh-token",
+            ),
+            "user@example.com"
+        );
+        assert_eq!(
+            resolve_idc_account_identity(None, Some("user-id".to_string()), "refresh-token"),
+            "user-id"
+        );
+    }
+
+    #[test]
+    fn optional_identity_merge_keeps_usage_before_jwt() {
+        assert_eq!(
+            merge_optional_identity(
+                Some("usage@example.com".to_string()),
+                None,
+                Some("jwt@example.com".to_string()),
+                Some("jwt-sub".to_string()),
+            ),
+            (
+                Some("usage@example.com".to_string()),
+                Some("jwt-sub".to_string())
+            )
+        );
     }
 }
