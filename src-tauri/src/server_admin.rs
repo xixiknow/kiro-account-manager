@@ -401,6 +401,17 @@ fn merge_optional_identity(
     )
 }
 
+fn resolve_stored_idc_user_id(
+    provider: &str,
+    display_id: &str,
+    user_id: Option<String>,
+) -> Option<String> {
+    user_id.or_else(|| {
+        (provider == "Enterprise" && !display_id.trim().is_empty())
+            .then(|| display_id.trim().to_string())
+    })
+}
+
 fn first_forwarded_value(value: &str) -> Option<String> {
     value
         .split(',')
@@ -1113,6 +1124,8 @@ async fn finish_idc_device_login(
         user_id.clone(),
         &token_response.refresh_token,
     );
+    let stored_user_id =
+        resolve_stored_idc_user_id(&pending.provider, &display_id, user_id.clone());
     let account_start_url = if pending.provider == "Enterprise" {
         Some(pending.start_url.clone())
     } else {
@@ -1145,7 +1158,7 @@ async fn finish_idc_device_login(
         if pending.provider == "Enterprise" || new_email.is_some() {
             existing.email.clone_from(&new_email);
         }
-        existing.user_id.clone_from(&user_id);
+        existing.user_id.clone_from(&stored_user_id);
         existing.provider = Some(pending.provider.clone());
         existing.auth_method = Some("IdC".to_string());
         existing.expires_at = Some(calc_expires_at(token_response.expires_in));
@@ -1169,9 +1182,12 @@ async fn finish_idc_device_login(
         existing.clone()
     } else {
         let mut account = if pending.provider == "Enterprise" {
-            Account::new_enterprise(display_id, "Kiro IAM Identity Center 账号".to_string())
+            Account::new_enterprise(
+                display_id.clone(),
+                "Kiro IAM Identity Center 账号".to_string(),
+            )
         } else {
-            Account::new(display_id, "Kiro BuilderId 账号".to_string())
+            Account::new(display_id.clone(), "Kiro BuilderId 账号".to_string())
         };
         if pending.provider == "Enterprise" || new_email.is_some() {
             account.email = new_email;
@@ -1180,7 +1196,7 @@ async fn finish_idc_device_login(
         account.refresh_token = Some(token_response.refresh_token.clone());
         account.provider = Some(pending.provider.clone());
         account.auth_method = Some("IdC".to_string());
-        account.user_id = user_id;
+        account.user_id = stored_user_id;
         account.expires_at = Some(calc_expires_at(token_response.expires_in));
         account.client_id = Some(pending.client_registration.client_id.clone());
         account.client_secret = Some(pending.client_registration.client_secret.clone());
@@ -1542,6 +1558,7 @@ async fn save_prompt_cache(
 mod tests {
     use super::{
         idc_refresh_token_fallback_identity, merge_optional_identity, resolve_idc_account_identity,
+        resolve_stored_idc_user_id,
     };
     use sha2::{Digest, Sha256};
 
@@ -1599,6 +1616,22 @@ mod tests {
                 Some("usage@example.com".to_string()),
                 Some("jwt-sub".to_string())
             )
+        );
+    }
+
+    #[test]
+    fn enterprise_idc_stores_display_fallback_as_user_id() {
+        assert_eq!(
+            resolve_stored_idc_user_id("Enterprise", "kiro_abcdef", None),
+            Some("kiro_abcdef".to_string())
+        );
+        assert_eq!(
+            resolve_stored_idc_user_id("Enterprise", "kiro_abcdef", Some("real-user".to_string())),
+            Some("real-user".to_string())
+        );
+        assert_eq!(
+            resolve_stored_idc_user_id("BuilderId", "kiro_abcdef", None),
+            None
         );
     }
 }

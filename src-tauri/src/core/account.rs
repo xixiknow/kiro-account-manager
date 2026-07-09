@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -381,12 +382,54 @@ fn infer_auth_method(account: &Account) -> Option<String> {
     None
 }
 
+fn is_idc_like_account(account: &Account) -> bool {
+    account
+        .auth_method
+        .as_deref()
+        .is_some_and(|method| method == "IdC")
+        || account
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider == "BuilderId" || provider == "Enterprise")
+        || (account.client_id.is_some() && account.client_secret.is_some())
+}
+
+fn refresh_token_fallback_identity(refresh_token: &str) -> Option<String> {
+    let trimmed = refresh_token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    let digest = hasher.finalize();
+    let prefix = digest[..3]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Some(format!("kiro_{prefix}"))
+}
+
 fn normalize_account(account: &mut Account) -> bool {
     let mut changed = false;
 
     if !has_value(account.auth_method.as_ref()) {
         if let Some(auth_method) = infer_auth_method(account) {
             account.auth_method = Some(auth_method);
+            changed = true;
+        }
+    }
+
+    if is_idc_like_account(account)
+        && !has_value(account.email.as_ref())
+        && !has_value(account.user_id.as_ref())
+    {
+        if let Some(identity) = account
+            .refresh_token
+            .as_deref()
+            .and_then(refresh_token_fallback_identity)
+        {
+            account.user_id = Some(identity);
             changed = true;
         }
     }
@@ -1235,6 +1278,24 @@ mod tests {
         assert!(changed);
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].auth_method.as_deref(), Some("IdC"));
+    }
+
+    #[test]
+    fn normalize_accounts_fills_missing_idc_identity_from_refresh_token() {
+        let refresh_token = "refresh-token-without-visible-identity";
+        let mut enterprise = Account::new_enterprise(
+            "temporary".to_string(),
+            "Kiro IAM Identity Center 账号".to_string(),
+        );
+        enterprise.email = None;
+        enterprise.user_id = None;
+        enterprise.refresh_token = Some(refresh_token.to_string());
+
+        let (normalized, changed) = normalize_accounts(vec![enterprise]);
+
+        assert!(changed);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].user_id.as_deref(), Some("kiro_1d5d0e"));
     }
 
     #[test]
