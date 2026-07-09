@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post, put},
@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -17,6 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex as AsyncMutex;
+use tower_http::services::ServeDir;
 
 use crate::{
     auth::{auth_social, providers::SocialTokenResponse},
@@ -26,14 +28,22 @@ use crate::{
         },
         kiro_auth_client::KiroAuthServiceClient,
     },
+    commands::account_cmd::{
+        AddAccountResult, UpdateAccountParams, VerifyAccountParams, VerifyAccountResponse,
+    },
+    commands::account_models::{fetch_all_available_models, write_available_models_cache},
     commands::app_settings_cmd::{self, AppSettings},
     commands::common::{
-        calc_expires_at, extract_user_info, extract_user_info_from_jwt, find_existing_account_idx,
-        generate_account_machine_id, get_usage_by_provider_with_machine_id,
-        resolve_idc_client_id_hash, save_store, update_account_status, KIRO_BUILDER_ID_START_URL,
+        apply_refreshed_account_tokens, calc_expires_at, ensure_account_machine_id,
+        extract_user_info, extract_user_info_from_jwt, find_existing_account_idx,
+        generate_account_machine_id, get_usage_by_account, get_usage_by_provider_with_machine_id,
+        is_auth_error_message, refresh_token_by_provider, resolve_idc_client_id_hash, save_store,
+        update_account_status, KIRO_BUILDER_ID_START_URL,
     },
     commands::kiro_settings_cmd,
-    core::account::{Account, AccountStore, GroupTagData, GroupTagStore},
+    core::account::{
+        Account, AccountProxyConfig, AccountStore, AccountTagLink, GroupTagData, GroupTagStore,
+    },
     gateway::{self, log_store, GatewayConfig, GatewayRequestLogEntry, GatewayStatus},
     services::session_storage::SessionStorage,
     utils::client_id_hash::normalize_start_url,
@@ -183,6 +193,7 @@ struct SocialCallbackQuery {
     error_description: Option<String>,
 }
 
+#[allow(dead_code)]
 pub fn require_admin_token_configured() -> Result<(), String> {
     let token = read_admin_token();
     if token.is_empty() {
@@ -194,8 +205,11 @@ pub fn require_admin_token_configured() -> Result<(), String> {
 }
 
 pub fn router(state: AdminState) -> Router {
+    let web_dir = resolve_server_web_dir().unwrap_or_else(|| PathBuf::from("server-web-dist"));
+
     Router::new()
         .route("/", get(index))
+        .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
         .route("/healthz", get(healthz))
         .route("/admin/api/auth/login", post(login))
         .route("/admin/api/auth/logout", post(logout))
@@ -220,6 +234,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/api/gateway/stop", post(stop_gateway))
         .route("/admin/api/accounts", get(list_accounts))
         .route("/admin/api/accounts/import", post(import_accounts))
+        .route("/admin/api/invoke/{command}", post(invoke_command))
         .route("/admin/api/groups-tags", get(groups_tags))
         .route("/admin/api/app/settings", get(get_app_settings))
         .route("/admin/api/app/settings", put(save_app_settings))
@@ -230,6 +245,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/api/logs", get(logs))
         .route("/admin/api/prompt-cache", get(get_prompt_cache))
         .route("/admin/api/prompt-cache", put(save_prompt_cache))
+        .fallback(get(index))
         .with_state(state)
 }
 
@@ -271,6 +287,21 @@ fn read_admin_token() -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+fn resolve_server_web_dir() -> Option<PathBuf> {
+    let candidates = [
+        std::env::var("KAM_WEB_DIR").ok().map(PathBuf::from),
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("server-web"))),
+        Some(PathBuf::from("/opt/kam/server-web")),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|dir| dir.join("index.html").is_file())
 }
 
 fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -538,8 +569,11 @@ fn callback_page(status: StatusCode, ok: bool, title: &str, message: &str) -> Re
     (status, Html(body)).into_response()
 }
 
-async fn index() -> Html<&'static str> {
-    Html(crate::server_web::ADMIN_HTML)
+async fn index() -> Html<String> {
+    let html = resolve_server_web_dir()
+        .and_then(|dir| std::fs::read_to_string(dir.join("index.html")).ok())
+        .unwrap_or_else(|| crate::server_web::ADMIN_HTML.to_string());
+    Html(html)
 }
 
 async fn healthz() -> Json<Value> {
@@ -1017,6 +1051,10 @@ async fn finish_social_online_login(
         return Err("BANNED: 账号已被封禁".to_string());
     }
 
+    let resolved_profile_arn = token_response
+        .profile_arn
+        .clone()
+        .or_else(|| usage_result.profile_arn.clone());
     let (new_email, user_id) = extract_user_info(&usage_result.usage_data);
     let final_email = new_email.clone().or(user_id.clone()).unwrap_or_else(|| {
         format!(
@@ -1054,7 +1092,7 @@ async fn finish_social_online_login(
         }
         existing.user_id = user_id;
         existing.id_token = token_response.id_token.clone();
-        existing.profile_arn = token_response.profile_arn.clone();
+        existing.profile_arn.clone_from(&resolved_profile_arn);
         existing.usage_data = Some(usage_result.usage_data);
         if existing
             .machine_id
@@ -1074,7 +1112,7 @@ async fn finish_social_online_login(
         account.auth_method = Some("social".to_string());
         account.user_id = user_id;
         account.id_token = token_response.id_token.clone();
-        account.profile_arn = token_response.profile_arn.clone();
+        account.profile_arn = resolved_profile_arn;
         account.usage_data = Some(usage_result.usage_data);
         account.machine_id = Some(pending.machine_id.clone());
         update_account_status(
@@ -1106,6 +1144,7 @@ async fn finish_idc_device_login(
         return Err("BANNED: 账号已被封禁".to_string());
     }
 
+    let resolved_profile_arn = usage_result.profile_arn.clone();
     let (usage_email, usage_user_id) = extract_user_info(&usage_result.usage_data);
     let jwt_identity = token_response
         .id_token
@@ -1169,7 +1208,7 @@ async fn finish_idc_device_login(
         existing.start_url = account_start_url.clone();
         existing.sso_session_id = token_response.aws_sso_app_session_id.clone();
         existing.id_token = token_response.id_token.clone();
-        existing.profile_arn = None;
+        existing.profile_arn.clone_from(&resolved_profile_arn);
         existing.usage_data = Some(usage_result.usage_data);
         if existing
             .machine_id
@@ -1205,7 +1244,7 @@ async fn finish_idc_device_login(
         account.start_url = account_start_url;
         account.sso_session_id = token_response.aws_sso_app_session_id.clone();
         account.id_token = token_response.id_token.clone();
-        account.profile_arn = None;
+        account.profile_arn = resolved_profile_arn;
         account.usage_data = Some(usage_result.usage_data);
         account.machine_id = Some(pending.machine_id.clone());
         update_account_status(
@@ -1219,6 +1258,294 @@ async fn finish_idc_device_login(
 
     save_store(&store)?;
     Ok(account)
+}
+
+async fn server_add_account_by_social(
+    state: &AdminState,
+    refresh_token: String,
+    provider: Option<String>,
+    machine_id: Option<String>,
+    access_token: Option<String>,
+) -> Result<AddAccountResult, String> {
+    let provider = provider
+        .as_deref()
+        .and_then(normalize_social_provider)
+        .unwrap_or("Google")
+        .to_string();
+    let machine_id = machine_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(generate_account_machine_id);
+    let mut account = Account::new("pending".to_string(), format!("Kiro {provider} 账号"));
+    account.provider = Some(provider.clone());
+    account.auth_method = Some("social".to_string());
+    account.refresh_token = Some(refresh_token.clone());
+    account.machine_id = Some(machine_id.clone());
+
+    let refresh = refresh_token_by_provider(&account).await?;
+    apply_refreshed_account_tokens(&mut account, &refresh);
+    if let Some(access_token) = access_token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        account.access_token = Some(access_token);
+    }
+    let final_access_token = account
+        .access_token
+        .clone()
+        .ok_or_else(|| "No access token after refresh".to_string())?;
+    let final_refresh_token = account
+        .refresh_token
+        .clone()
+        .unwrap_or_else(|| refresh_token.clone());
+
+    let usage_result =
+        get_usage_by_provider_with_machine_id(&provider, &final_access_token, &machine_id).await?;
+    if usage_result.is_banned {
+        return Err("BANNED: 账号已被封禁".to_string());
+    }
+    if let Some(profile_arn) = usage_result.profile_arn.clone() {
+        account.profile_arn = Some(profile_arn);
+    }
+    let (new_email, user_id) = extract_user_info(&usage_result.usage_data);
+    let display_id = new_email.clone().or(user_id.clone()).unwrap_or_else(|| {
+        format!(
+            "{}_{}",
+            provider.to_lowercase(),
+            final_refresh_token.chars().take(8).collect::<String>()
+        )
+    });
+
+    let mut store = state
+        .accounts
+        .lock()
+        .map_err(|_| "account store lock failed".to_string())?;
+    let existing_idx = find_existing_account_idx(
+        &store.accounts,
+        new_email.as_ref(),
+        &provider,
+        &final_refresh_token,
+        user_id.as_ref(),
+    );
+    let is_new = existing_idx.is_none();
+    let result_account = if let Some(idx) = existing_idx {
+        let existing = &mut store.accounts[idx];
+        existing.access_token.clone_from(&account.access_token);
+        existing.refresh_token = Some(final_refresh_token.clone());
+        existing.expires_at.clone_from(&account.expires_at);
+        existing.provider = Some(provider.clone());
+        existing.auth_method = Some("social".to_string());
+        if new_email.is_some() {
+            existing.email.clone_from(&new_email);
+        }
+        existing.user_id = user_id;
+        existing.id_token.clone_from(&account.id_token);
+        existing.profile_arn.clone_from(&account.profile_arn);
+        existing.usage_data = Some(usage_result.usage_data);
+        if existing
+            .machine_id
+            .as_ref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            existing.machine_id = Some(machine_id);
+        }
+        update_account_status(existing, usage_result.is_banned, usage_result.is_auth_error);
+        existing.clone()
+    } else {
+        account.email = Some(display_id);
+        account.user_id = user_id;
+        account.refresh_token = Some(final_refresh_token);
+        account.usage_data = Some(usage_result.usage_data);
+        update_account_status(
+            &mut account,
+            usage_result.is_banned,
+            usage_result.is_auth_error,
+        );
+        store.accounts.insert(0, account.clone());
+        account
+    };
+
+    save_store(&store)?;
+    Ok(AddAccountResult {
+        account: result_account,
+        is_new,
+    })
+}
+
+async fn server_add_account_by_idc(
+    state: &AdminState,
+    payload: &Value,
+) -> Result<AddAccountResult, String> {
+    let provider = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .and_then(normalize_idc_provider)
+        .unwrap_or("BuilderId")
+        .to_string();
+    let refresh_token = payload_string(payload, "refreshToken")?;
+    let client_id = payload_string(payload, "clientId")?;
+    let client_secret = payload_string(payload, "clientSecret")?;
+    let region = payload
+        .get("region")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("us-east-1")
+        .to_string();
+    let machine_id = payload
+        .get("machineId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(generate_account_machine_id);
+    let start_url = if provider == "Enterprise" {
+        Some(resolve_idc_start_url(
+            &provider,
+            payload
+                .get("startUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        )?)
+    } else {
+        None
+    };
+
+    let mut account = if provider == "Enterprise" {
+        Account::new_enterprise(
+            "pending".to_string(),
+            "Kiro IAM Identity Center 账号".to_string(),
+        )
+    } else {
+        Account::new("pending".to_string(), "Kiro BuilderId 账号".to_string())
+    };
+    account.provider = Some(provider.clone());
+    account.auth_method = Some("IdC".to_string());
+    account.refresh_token = Some(refresh_token.clone());
+    account.client_id = Some(client_id);
+    account.client_secret = Some(client_secret);
+    account.region = Some(region.clone());
+    account.machine_id = Some(machine_id.clone());
+    account.start_url.clone_from(&start_url);
+    account.password = payload
+        .get("password")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    account.client_id_hash = payload
+        .get("clientIdHash")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| resolve_idc_client_id_hash(&provider, None, start_url.as_deref()).ok());
+
+    let refresh = refresh_token_by_provider(&account).await?;
+    apply_refreshed_account_tokens(&mut account, &refresh);
+    if let Some(access_token) = payload
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        account.access_token = Some(access_token.to_string());
+    }
+    let access_token = account
+        .access_token
+        .clone()
+        .ok_or_else(|| "No access token after refresh".to_string())?;
+    let final_refresh_token = account
+        .refresh_token
+        .clone()
+        .unwrap_or_else(|| refresh_token.clone());
+    let usage_result =
+        get_usage_by_provider_with_machine_id(&provider, &access_token, &machine_id).await?;
+    if usage_result.is_banned {
+        return Err("BANNED: 账号已被封禁".to_string());
+    }
+    if let Some(profile_arn) = usage_result.profile_arn.clone() {
+        account.profile_arn = Some(profile_arn);
+    }
+
+    let (usage_email, usage_user_id) = extract_user_info(&usage_result.usage_data);
+    let jwt_identity = account
+        .id_token
+        .as_deref()
+        .map(extract_user_info_from_jwt)
+        .filter(|(email, user_id)| email.is_some() || user_id.is_some())
+        .or_else(|| {
+            let identity = extract_user_info_from_jwt(&access_token);
+            (identity.0.is_some() || identity.1.is_some()).then_some(identity)
+        })
+        .unwrap_or((None, None));
+    let (new_email, user_id) =
+        merge_optional_identity(usage_email, usage_user_id, jwt_identity.0, jwt_identity.1);
+    let display_id =
+        resolve_idc_account_identity(new_email.clone(), user_id.clone(), &final_refresh_token);
+    let stored_user_id = resolve_stored_idc_user_id(&provider, &display_id, user_id.clone());
+
+    let mut store = state
+        .accounts
+        .lock()
+        .map_err(|_| "account store lock failed".to_string())?;
+    let existing_idx = find_existing_account_idx(
+        &store.accounts,
+        new_email.as_ref(),
+        &provider,
+        &final_refresh_token,
+        user_id.as_ref(),
+    );
+    let is_new = existing_idx.is_none();
+    let result_account = if let Some(idx) = existing_idx {
+        let existing = &mut store.accounts[idx];
+        existing.access_token.clone_from(&account.access_token);
+        existing.refresh_token = Some(final_refresh_token.clone());
+        existing.expires_at.clone_from(&account.expires_at);
+        existing.provider = Some(provider.clone());
+        existing.auth_method = Some("IdC".to_string());
+        if provider == "Enterprise" || new_email.is_some() {
+            existing.email.clone_from(&new_email);
+        }
+        existing.user_id.clone_from(&stored_user_id);
+        existing.client_id.clone_from(&account.client_id);
+        existing.client_secret.clone_from(&account.client_secret);
+        existing.client_id_hash.clone_from(&account.client_id_hash);
+        existing.region = Some(region.clone());
+        existing.start_url.clone_from(&start_url);
+        existing.sso_session_id.clone_from(&account.sso_session_id);
+        existing.id_token.clone_from(&account.id_token);
+        existing.profile_arn.clone_from(&account.profile_arn);
+        existing.password.clone_from(&account.password);
+        existing.usage_data = Some(usage_result.usage_data);
+        if existing
+            .machine_id
+            .as_ref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            existing.machine_id = Some(machine_id);
+        }
+        update_account_status(existing, usage_result.is_banned, usage_result.is_auth_error);
+        existing.clone()
+    } else {
+        if provider == "Enterprise" || new_email.is_some() {
+            account.email = new_email;
+        } else {
+            account.email = Some(display_id.clone());
+        }
+        account.user_id = stored_user_id;
+        account.refresh_token = Some(final_refresh_token);
+        account.usage_data = Some(usage_result.usage_data);
+        update_account_status(
+            &mut account,
+            usage_result.is_banned,
+            usage_result.is_auth_error,
+        );
+        store.accounts.insert(0, account.clone());
+        account
+    };
+
+    save_store(&store)?;
+    Ok(AddAccountResult {
+        account: result_account,
+        is_new,
+    })
 }
 
 async fn gateway_status(state: &AdminState) -> GatewayStatus {
@@ -1334,6 +1661,1248 @@ async fn list_accounts(headers: HeaderMap, State(state): State<AdminState>) -> R
     };
 
     Json(store.get_all()).into_response()
+}
+
+fn missing_arg(name: &str) -> Response {
+    json_error(StatusCode::BAD_REQUEST, format!("missing argument: {name}"))
+}
+
+fn json_result<T: Serialize>(result: Result<T, String>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+fn arg_string(payload: &Value, name: &str) -> Result<String, Response> {
+    payload
+        .get(name)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| missing_arg(name))
+}
+
+fn payload_string(payload: &Value, name: &str) -> Result<String, String> {
+    payload
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("{name} is required"))
+}
+
+fn arg_bool(payload: &Value, name: &str) -> Result<bool, Response> {
+    payload
+        .get(name)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| missing_arg(name))
+}
+
+fn arg_string_vec(payload: &Value, name: &str) -> Result<Vec<String>, Response> {
+    payload
+        .get(name)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error.to_string()))?
+        .ok_or_else(|| missing_arg(name))
+}
+
+fn set_account_status_from_error(account: &mut Account, error: &str) {
+    if error.starts_with("BANNED:") {
+        account.status = "banned".to_string();
+        account.enabled = false;
+    } else if is_auth_error_message(error) {
+        account.status = "invalid".to_string();
+        account.enabled = false;
+    }
+}
+
+async fn server_sync_account(state: &AdminState, id: String) -> Result<Value, String> {
+    let mut account = {
+        let mut store = state
+            .accounts
+            .lock()
+            .map_err(|_| "account store lock failed".to_string())?;
+        let mut should_save = false;
+        let account = {
+            let stored = store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| "账号不存在".to_string())?;
+            if stored
+                .machine_id
+                .as_ref()
+                .is_none_or(|machine_id| machine_id.trim().is_empty())
+            {
+                ensure_account_machine_id(stored);
+                should_save = true;
+            }
+            stored.clone()
+        };
+        if should_save {
+            save_store(&store)?;
+        }
+        account
+    };
+
+    let access_token = account
+        .access_token
+        .clone()
+        .ok_or_else(|| "No access token".to_string())?;
+
+    let mut usage_result = get_usage_by_account(&account, &access_token).await;
+    let mut warning = None;
+
+    if matches!(usage_result, Ok(ref result) if result.is_auth_error) {
+        match refresh_token_by_provider(&account).await {
+            Ok(refresh) => {
+                apply_refreshed_account_tokens(&mut account, &refresh);
+                let retry_token = account
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| "No access token after refresh".to_string())?;
+                usage_result = get_usage_by_account(&account, &retry_token).await;
+            }
+            Err(error) => {
+                let mut store = state
+                    .accounts
+                    .lock()
+                    .map_err(|_| "account store lock failed".to_string())?;
+                if let Some(stored) = store.accounts.iter_mut().find(|item| item.id == id) {
+                    set_account_status_from_error(stored, &error);
+                    save_store(&store)?;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    let mut store = state
+        .accounts
+        .lock()
+        .map_err(|_| "account store lock failed".to_string())?;
+    let stored = store
+        .accounts
+        .iter_mut()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+
+    if stored
+        .machine_id
+        .as_ref()
+        .is_none_or(|machine_id| machine_id.trim().is_empty())
+    {
+        stored.machine_id.clone_from(&account.machine_id);
+    }
+    if account.access_token.is_some() {
+        stored.access_token.clone_from(&account.access_token);
+        stored.refresh_token.clone_from(&account.refresh_token);
+        stored.expires_at.clone_from(&account.expires_at);
+        stored.id_token.clone_from(&account.id_token);
+        stored.sso_session_id.clone_from(&account.sso_session_id);
+    }
+
+    match usage_result {
+        Ok(usage) => {
+            if let Some(profile_arn) = usage.profile_arn.clone() {
+                stored.profile_arn = Some(profile_arn);
+            }
+            stored.usage_data = Some(usage.usage_data);
+            update_account_status(stored, usage.is_banned, usage.is_auth_error);
+            if stored.status == "active" {
+                stored.enabled = true;
+            }
+        }
+        Err(error) => {
+            warning = Some(format!("获取配额失败: {error}"));
+            if !matches!(stored.status.as_str(), "banned" | "封禁" | "已封禁")
+                && !is_auth_error_message(&error)
+            {
+                stored.status = "active".to_string();
+                stored.enabled = true;
+            }
+        }
+    }
+
+    let account = stored.clone();
+    save_store(&store)?;
+    Ok(json!({ "account": account, "warning": warning }))
+}
+
+async fn server_refresh_account_token(state: &AdminState, id: String) -> Result<Account, String> {
+    let mut account = {
+        let mut store = state
+            .accounts
+            .lock()
+            .map_err(|_| "account store lock failed".to_string())?;
+        let mut should_save = false;
+        let account = {
+            let stored = store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| "账号不存在".to_string())?;
+            if stored
+                .machine_id
+                .as_ref()
+                .is_none_or(|machine_id| machine_id.trim().is_empty())
+            {
+                ensure_account_machine_id(stored);
+                should_save = true;
+            }
+            stored.clone()
+        };
+        if should_save {
+            save_store(&store)?;
+        }
+        account
+    };
+
+    let refresh = refresh_token_by_provider(&account).await?;
+    apply_refreshed_account_tokens(&mut account, &refresh);
+    if matches!(
+        account.status.as_str(),
+        "invalid" | "失效" | "已失效" | "Token已失效"
+    ) {
+        account.status = "active".to_string();
+        account.enabled = true;
+    }
+
+    let mut store = state
+        .accounts
+        .lock()
+        .map_err(|_| "account store lock failed".to_string())?;
+    let stored = store
+        .accounts
+        .iter_mut()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+    *stored = account.clone();
+    save_store(&store)?;
+    Ok(account)
+}
+
+async fn server_verify_account(
+    state: &AdminState,
+    params: VerifyAccountParams,
+) -> Result<VerifyAccountResponse, String> {
+    let VerifyAccountParams {
+        access_token: _,
+        refresh_token,
+        provider,
+        client_id,
+        client_secret,
+        region,
+    } = params;
+
+    let mut account = {
+        let store = state
+            .accounts
+            .lock()
+            .map_err(|_| "account store lock failed".to_string())?;
+        store
+            .accounts
+            .iter()
+            .find(|account| account.refresh_token.as_ref() == Some(&refresh_token))
+            .cloned()
+            .unwrap_or_else(|| {
+                if provider == "Enterprise" {
+                    Account::new_enterprise(
+                        "pending".to_string(),
+                        "Kiro Enterprise 账号".to_string(),
+                    )
+                } else {
+                    Account::new("pending".to_string(), format!("Kiro {provider} 账号"))
+                }
+            })
+    };
+
+    account.provider = Some(provider.clone());
+    account.refresh_token = Some(refresh_token.clone());
+    if provider == "BuilderId" || provider == "Enterprise" {
+        account.auth_method = Some("IdC".to_string());
+        if let Some(client_id) = client_id {
+            account.client_id = Some(client_id);
+        }
+        if let Some(client_secret) = client_secret {
+            account.client_secret = Some(client_secret);
+        }
+        if let Some(region) = region {
+            account.region = Some(region);
+        }
+    }
+    ensure_account_machine_id(&mut account);
+
+    let refresh = refresh_token_by_provider(&account).await?;
+    apply_refreshed_account_tokens(&mut account, &refresh);
+    let access_token = account
+        .access_token
+        .clone()
+        .ok_or_else(|| "No access token after refresh".to_string())?;
+    let refresh_token = account
+        .refresh_token
+        .clone()
+        .ok_or_else(|| "No refresh token after refresh".to_string())?;
+
+    let usage = get_usage_by_account(&account, &access_token).await?;
+    if let Some(profile_arn) = usage.profile_arn.clone() {
+        account.profile_arn = Some(profile_arn);
+    }
+    let usage_data = usage.usage_data.clone();
+    account.usage_data = Some(usage.usage_data);
+    update_account_status(&mut account, usage.is_banned, usage.is_auth_error);
+    if account.status == "active" {
+        account.enabled = true;
+    }
+
+    {
+        let mut store = state
+            .accounts
+            .lock()
+            .map_err(|_| "account store lock failed".to_string())?;
+        if let Some(stored) = store.accounts.iter_mut().find(|item| {
+            item.id == account.id || item.refresh_token.as_ref() == Some(&refresh_token)
+        }) {
+            *stored = account;
+            save_store(&store)?;
+        }
+    }
+
+    Ok(VerifyAccountResponse {
+        usage_data,
+        access_token,
+        refresh_token,
+    })
+}
+
+async fn server_list_available_models(
+    state: &AdminState,
+    id: String,
+    force_refresh: bool,
+) -> Result<Value, String> {
+    let account = {
+        let mut store = state
+            .accounts
+            .lock()
+            .map_err(|_| "account store lock failed".to_string())?;
+        let mut should_save = false;
+        let account = {
+            let stored = store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| "账号不存在".to_string())?;
+            if stored
+                .machine_id
+                .as_ref()
+                .is_none_or(|machine_id| machine_id.trim().is_empty())
+            {
+                ensure_account_machine_id(stored);
+                should_save = true;
+            }
+            stored.clone()
+        };
+        if should_save {
+            save_store(&store)?;
+        }
+        account
+    };
+    let access_token = account
+        .access_token
+        .clone()
+        .ok_or_else(|| "账号缺少 access_token，请先刷新 Token".to_string())?;
+    let result = fetch_all_available_models(&account, &access_token).await?;
+    let mut store = state
+        .accounts
+        .lock()
+        .map_err(|_| "account store lock failed".to_string())?;
+    if let Some(stored) = store.accounts.iter_mut().find(|item| item.id == id) {
+        if stored
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            stored.profile_arn = result.resolved_profile_arn.clone();
+        }
+        if !force_refresh {
+            write_available_models_cache(stored, &result.response)?;
+        }
+        save_store(&store)?;
+    }
+    serde_json::to_value(result.response).map_err(|error| error.to_string())
+}
+
+fn server_update_account(
+    state: &AdminState,
+    params: UpdateAccountParams,
+) -> Result<Account, String> {
+    let mut store = state
+        .accounts
+        .lock()
+        .map_err(|_| "account store lock failed".to_string())?;
+    let account = store
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == params.id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+
+    if let Some(label) = params.label {
+        account.label = label;
+    }
+    if let Some(status) = params.status {
+        account.status = status;
+    }
+    if let Some(access_token) = params.access_token {
+        account.access_token = Some(access_token);
+    }
+    if let Some(refresh_token) = params.refresh_token {
+        account.refresh_token = Some(refresh_token);
+    }
+    if let Some(client_id) = params.client_id {
+        account.client_id = Some(client_id);
+    }
+    if let Some(client_secret) = params.client_secret {
+        account.client_secret = Some(client_secret);
+    }
+    if let Some(machine_id) = params.machine_id {
+        account.machine_id = Some(machine_id);
+    }
+    if let Some(added_at) = params.added_at {
+        let trimmed = added_at.trim();
+        if !trimmed.is_empty() {
+            account.added_at = trimmed.to_string();
+        }
+    }
+    if let Some(expires_at) = params.expires_at {
+        let trimmed = expires_at.trim();
+        account.expires_at = (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+    if let Some(enabled) = params.enabled {
+        account.enabled = enabled;
+    }
+    if let Some(proxy_config) = params.proxy_config {
+        account.proxy_config = proxy_config.enabled.then_some(proxy_config);
+        account.available_models_cache = None;
+    }
+
+    let result = account.clone();
+    save_store(&store)?;
+    Ok(result)
+}
+
+async fn invoke_command(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+    Path(command): Path<String>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    match command.as_str() {
+        "show_main_window" | "logout" | "cancel_kiro_login" => Json(json!(null)).into_response(),
+        "get_supported_providers" => {
+            Json(vec!["Google", "Github", "BuilderId", "Enterprise"]).into_response()
+        }
+        "get_current_user" => Json(json!({
+            "id": "server-admin",
+            "email": "server-admin",
+            "name": "Server Admin"
+        }))
+        .into_response(),
+        "get_accounts" => list_accounts(headers, State(state)).await,
+        "get_available_accounts" => {
+            let store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            Json(
+                store
+                    .get_available_accounts()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
+        "delete_account" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            json_result(store.delete(&id))
+        }
+        "delete_account_remote" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            json_result(store.delete(&id))
+        }
+        "delete_accounts" => {
+            let ids = match arg_string_vec(&payload, "ids") {
+                Ok(ids) => ids,
+                Err(response) => return response,
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            json_result(store.delete_many(&ids))
+        }
+        "update_account" => {
+            let params_value = payload.get("params").cloned().unwrap_or(payload);
+            let params = match serde_json::from_value::<UpdateAccountParams>(params_value) {
+                Ok(params) => params,
+                Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+            };
+            json_result(server_update_account(&state, params))
+        }
+        "sync_account" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            json_result(server_sync_account(&state, id).await)
+        }
+        "refresh_account_token" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            json_result(server_refresh_account_token(&state, id).await)
+        }
+        "verify_account" => {
+            let params_value = payload.get("params").cloned().unwrap_or(payload);
+            let params = match serde_json::from_value::<VerifyAccountParams>(params_value) {
+                Ok(params) => params,
+                Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+            };
+            json_result(server_verify_account(&state, params).await)
+        }
+        "list_available_models" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            let force_refresh = payload
+                .get("forceRefresh")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            json_result(server_list_available_models(&state, id, force_refresh).await)
+        }
+        "import_accounts" => {
+            let json_text = match arg_string(&payload, "json") {
+                Ok(json) => json,
+                Err(response) => return response,
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            json_result(store.import_from_json(&json_text))
+        }
+        "add_account_by_social" => {
+            let refresh_token = match arg_string(&payload, "refreshToken") {
+                Ok(refresh_token) => refresh_token,
+                Err(response) => return response,
+            };
+            let provider = payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let machine_id = payload
+                .get("machineId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let access_token = payload
+                .get("accessToken")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            json_result(
+                server_add_account_by_social(
+                    &state,
+                    refresh_token,
+                    provider,
+                    machine_id,
+                    access_token,
+                )
+                .await,
+            )
+        }
+        "add_account_by_idc" => json_result(server_add_account_by_idc(&state, &payload).await),
+        "export_accounts" => {
+            let ids = payload
+                .get("ids")
+                .cloned()
+                .map(serde_json::from_value::<Option<Vec<String>>>)
+                .transpose()
+                .unwrap_or(None)
+                .flatten();
+            let store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            let accounts = match ids {
+                Some(ids) => store
+                    .accounts
+                    .iter()
+                    .filter(|account| ids.contains(&account.id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None => store.accounts.clone(),
+            };
+            json_result(serde_json::to_string_pretty(&accounts).map_err(|e| e.to_string()))
+        }
+        "get_groups" => {
+            let store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            Json(store.get_groups()).into_response()
+        }
+        "get_tags" => {
+            let store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            Json(store.get_tags()).into_response()
+        }
+        "add_group" => {
+            let name = match arg_string(&payload, "name") {
+                Ok(name) => name,
+                Err(response) => return response,
+            };
+            let color = payload
+                .get("color")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let mut store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            json_result(store.add_group(name, color))
+        }
+        "update_group" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let color = payload
+                .get("color")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let mut store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            json_result(store.update_group(&id, name, color))
+        }
+        "reorder_groups" => {
+            let ids = match arg_string_vec(&payload, "ids") {
+                Ok(ids) => ids,
+                Err(response) => return response,
+            };
+            let mut store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            json_result(store.reorder_groups(&ids))
+        }
+        "delete_group" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            {
+                let mut accounts = match state.accounts.lock() {
+                    Ok(store) => store,
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "account store lock failed",
+                        )
+                    }
+                };
+                for account in &mut accounts.accounts {
+                    if account.group_id.as_deref() == Some(id.as_str()) {
+                        account.group_id = None;
+                    }
+                }
+                if let Err(error) = save_store(&accounts) {
+                    return json_error(StatusCode::BAD_REQUEST, error);
+                }
+            }
+            let mut store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            json_result(store.delete_group(&id))
+        }
+        "add_tag" => {
+            let name = match arg_string(&payload, "name") {
+                Ok(name) => name,
+                Err(response) => return response,
+            };
+            let color = match arg_string(&payload, "color") {
+                Ok(color) => color,
+                Err(response) => return response,
+            };
+            let mut store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            json_result(store.add_tag(name, color))
+        }
+        "update_tag" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let color = payload
+                .get("color")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let mut store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            json_result(store.update_tag(&id, name, color))
+        }
+        "delete_tag" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            {
+                let mut accounts = match state.accounts.lock() {
+                    Ok(store) => store,
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "account store lock failed",
+                        )
+                    }
+                };
+                for account in &mut accounts.accounts {
+                    account.tag_links.retain(|link| link.tag_id != id);
+                }
+                if let Err(error) = save_store(&accounts) {
+                    return json_error(StatusCode::BAD_REQUEST, error);
+                }
+            }
+            let mut store = match state.group_tags.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "group/tag store lock failed",
+                    )
+                }
+            };
+            json_result(store.delete_tag(&id))
+        }
+        "set_account_group" => {
+            let account_id = match arg_string(&payload, "accountId") {
+                Ok(account_id) => account_id,
+                Err(response) => return response,
+            };
+            let group_id = payload
+                .get("groupId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            if let Some(account) = store.accounts.iter_mut().find(|item| item.id == account_id) {
+                account.group_id = group_id;
+                json_result(save_store(&store))
+            } else {
+                json_error(StatusCode::NOT_FOUND, "账号不存在")
+            }
+        }
+        "set_account_tags" => {
+            let account_id = match arg_string(&payload, "accountId") {
+                Ok(account_id) => account_id,
+                Err(response) => return response,
+            };
+            let tag_ids = match arg_string_vec(&payload, "tagIds") {
+                Ok(tag_ids) => tag_ids,
+                Err(response) => return response,
+            };
+            let tag_names = {
+                let tags = match state.group_tags.lock() {
+                    Ok(store) => store.get_tags(),
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "group/tag store lock failed",
+                        )
+                    }
+                };
+                tags.into_iter()
+                    .map(|tag| (tag.id, tag.name))
+                    .collect::<HashMap<_, _>>()
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            if let Some(account) = store.accounts.iter_mut().find(|item| item.id == account_id) {
+                account
+                    .tag_links
+                    .retain(|link| tag_ids.contains(&link.tag_id));
+                let existing = account
+                    .tag_links
+                    .iter()
+                    .map(|link| link.tag_id.clone())
+                    .collect::<Vec<_>>();
+                for tag_id in tag_ids {
+                    if !existing.contains(&tag_id) {
+                        account.tag_links.push(AccountTagLink::new(
+                            tag_id.clone(),
+                            tag_names.get(&tag_id).cloned(),
+                        ));
+                    }
+                }
+                json_result(save_store(&store))
+            } else {
+                json_error(StatusCode::NOT_FOUND, "账号不存在")
+            }
+        }
+        "add_tag_to_account" => {
+            let account_id = match arg_string(&payload, "accountId") {
+                Ok(account_id) => account_id,
+                Err(response) => return response,
+            };
+            let tag_id = match arg_string(&payload, "tagId") {
+                Ok(tag_id) => tag_id,
+                Err(response) => return response,
+            };
+            let tag_name = {
+                let store = match state.group_tags.lock() {
+                    Ok(store) => store,
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "group/tag store lock failed",
+                        )
+                    }
+                };
+                store
+                    .get_tags()
+                    .into_iter()
+                    .find(|tag| tag.id == tag_id)
+                    .map(|tag| tag.name)
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            if let Some(account) = store.accounts.iter_mut().find(|item| item.id == account_id) {
+                if !account.tag_links.iter().any(|link| link.tag_id == tag_id) {
+                    account
+                        .tag_links
+                        .push(AccountTagLink::new(tag_id, tag_name));
+                }
+                json_result(save_store(&store))
+            } else {
+                json_error(StatusCode::NOT_FOUND, "账号不存在")
+            }
+        }
+        "remove_tag_from_account" => {
+            let account_id = match arg_string(&payload, "accountId") {
+                Ok(account_id) => account_id,
+                Err(response) => return response,
+            };
+            let tag_id = match arg_string(&payload, "tagId") {
+                Ok(tag_id) => tag_id,
+                Err(response) => return response,
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            if let Some(account) = store.accounts.iter_mut().find(|item| item.id == account_id) {
+                account.tag_links.retain(|link| link.tag_id != tag_id);
+                json_result(save_store(&store))
+            } else {
+                json_error(StatusCode::NOT_FOUND, "账号不存在")
+            }
+        }
+        "remove_account_tags" => {
+            let account_id = match arg_string(&payload, "accountId") {
+                Ok(account_id) => account_id,
+                Err(response) => return response,
+            };
+            let tag_ids = match arg_string_vec(&payload, "tagIds") {
+                Ok(tag_ids) => tag_ids,
+                Err(response) => return response,
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            if let Some(account) = store.accounts.iter_mut().find(|item| item.id == account_id) {
+                account
+                    .tag_links
+                    .retain(|link| !tag_ids.contains(&link.tag_id));
+                json_result(save_store(&store))
+            } else {
+                json_error(StatusCode::NOT_FOUND, "账号不存在")
+            }
+        }
+        "get_gateway_config" => json_result(gateway::get_gateway_config()),
+        "save_gateway_config" => {
+            let config_value = payload.get("config").cloned().unwrap_or(payload);
+            let config = match serde_json::from_value::<GatewayConfig>(config_value) {
+                Ok(config) => config,
+                Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+            };
+            json_result(gateway::save_gateway_config(&config))
+        }
+        "get_gateway_status" => Json(gateway_status(&state).await).into_response(),
+        "start_gateway" | "stop_gateway" => Json(gateway_status(&state).await).into_response(),
+        "get_gateway_log_dir" => Json(
+            std::env::var("KAM_DATA_DIR")
+                .map(|dir| format!("{}/gateway/logs", dir.trim_end_matches(['/', '\\'])))
+                .unwrap_or_default(),
+        )
+        .into_response(),
+        "get_gateway_request_logs" => {
+            let limit = payload
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(500);
+            Json(state.log_store.get_last(limit).await).into_response()
+        }
+        "get_gateway_request_stats" => Json(state.log_store.get_stats().await).into_response(),
+        "get_gateway_model_stats" => Json(state.log_store.get_model_stats().await).into_response(),
+        "get_gateway_endpoint_stats" => {
+            Json(state.log_store.get_endpoint_stats().await).into_response()
+        }
+        "clear_gateway_request_logs" => {
+            state.log_store.clear().await;
+            Json(json!(null)).into_response()
+        }
+        "get_app_settings" => json_result(app_settings_cmd::get_app_settings_inner()),
+        "save_app_settings" => {
+            let updates = payload.get("settings").cloned().unwrap_or(payload);
+            let mut current = app_settings_cmd::get_app_settings_inner().unwrap_or_default();
+            if let Ok(update_value) = serde_json::to_value(&updates) {
+                let mut current_value =
+                    serde_json::to_value(&current).unwrap_or_else(|_| json!({}));
+                if let (Some(current_obj), Some(update_obj)) =
+                    (current_value.as_object_mut(), update_value.as_object())
+                {
+                    for (key, value) in update_obj {
+                        current_obj.insert(key.clone(), value.clone());
+                    }
+                    if let Ok(merged) = serde_json::from_value::<AppSettings>(current_value) {
+                        current = merged;
+                    }
+                }
+            }
+            json_result(app_settings_cmd::save_settings_to_file(&current).map(|_| current))
+        }
+        "get_usage_history" => json_result(app_settings_cmd::get_usage_history().await),
+        "save_usage_history_entry" => {
+            let entry_value = payload.get("entry").cloned().unwrap_or(payload);
+            let entry = match serde_json::from_value(entry_value) {
+                Ok(entry) => entry,
+                Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+            };
+            json_result(app_settings_cmd::save_usage_history_entry(entry).await)
+        }
+        "get_kiro_settings" => match kiro_settings_cmd::get_kiro_settings().await {
+            Ok(settings) => Json(settings).into_response(),
+            Err(error) => Json(json!({ "unavailable": true, "message": error })).into_response(),
+        },
+        "list_workspaces" => {
+            match SessionStorage::new().and_then(|storage| storage.list_workspaces()) {
+                Ok(workspaces) => Json(workspaces).into_response(),
+                Err(error) => Json(json!({ "unavailable": true, "message": error.to_string() }))
+                    .into_response(),
+            }
+        }
+        "list_sessions" => {
+            let workspace_hash = match arg_string(&payload, "workspaceHash") {
+                Ok(workspace_hash) => workspace_hash,
+                Err(response) => return response,
+            };
+            match SessionStorage::new().and_then(|storage| storage.list_sessions(&workspace_hash)) {
+                Ok(sessions) => Json(sessions).into_response(),
+                Err(error) => Json(json!({ "unavailable": true, "message": error.to_string() }))
+                    .into_response(),
+            }
+        }
+        "load_session" => {
+            let workspace_hash = match arg_string(&payload, "workspaceHash") {
+                Ok(workspace_hash) => workspace_hash,
+                Err(response) => return response,
+            };
+            let session_id = match arg_string(&payload, "sessionId") {
+                Ok(session_id) => session_id,
+                Err(response) => return response,
+            };
+            json_result(
+                SessionStorage::new()
+                    .and_then(|storage| storage.load_session(&workspace_hash, &session_id))
+                    .map_err(|error| error.to_string()),
+            )
+        }
+        "delete_session" => {
+            let workspace_hash = match arg_string(&payload, "workspaceHash") {
+                Ok(workspace_hash) => workspace_hash,
+                Err(response) => return response,
+            };
+            let session_id = match arg_string(&payload, "sessionId") {
+                Ok(session_id) => session_id,
+                Err(response) => return response,
+            };
+            json_result(
+                SessionStorage::new()
+                    .and_then(|storage| storage.delete_session(&workspace_hash, &session_id))
+                    .map_err(|error| error.to_string()),
+            )
+        }
+        "delete_workspace" => {
+            let workspace_hash = match arg_string(&payload, "workspaceHash") {
+                Ok(workspace_hash) => workspace_hash,
+                Err(response) => return response,
+            };
+            json_result(
+                SessionStorage::new()
+                    .and_then(|storage| storage.delete_workspace(&workspace_hash))
+                    .map_err(|error| error.to_string()),
+            )
+        }
+        "export_session" => {
+            let workspace_hash = match arg_string(&payload, "workspaceHash") {
+                Ok(workspace_hash) => workspace_hash,
+                Err(response) => return response,
+            };
+            let session_id = match arg_string(&payload, "sessionId") {
+                Ok(session_id) => session_id,
+                Err(response) => return response,
+            };
+            let format = payload
+                .get("format")
+                .and_then(Value::as_str)
+                .unwrap_or("markdown");
+            let export_format = match format {
+                "json" => crate::services::session_storage::ExportFormat::Json,
+                "markdown" => crate::services::session_storage::ExportFormat::Markdown,
+                _ => return json_error(StatusCode::BAD_REQUEST, "Invalid format"),
+            };
+            json_result(
+                SessionStorage::new()
+                    .and_then(|storage| {
+                        storage.export_session(&workspace_hash, &session_id, export_format)
+                    })
+                    .map_err(|error| error.to_string()),
+            )
+        }
+        "search_sessions" => {
+            let query = match arg_string(&payload, "query") {
+                Ok(query) => query.to_lowercase(),
+                Err(response) => return response,
+            };
+            match SessionStorage::new() {
+                Ok(storage) => {
+                    let mut results = Vec::new();
+                    if let Ok(workspaces) = storage.list_workspaces() {
+                        for workspace in workspaces {
+                            if let Ok(sessions) = storage.list_sessions(&workspace) {
+                                results.extend(sessions.into_iter().filter(|session| {
+                                    session.title.to_lowercase().contains(&query)
+                                }));
+                            }
+                        }
+                    }
+                    Json(results).into_response()
+                }
+                Err(error) => Json(json!({ "unavailable": true, "message": error.to_string() }))
+                    .into_response(),
+            }
+        }
+        "get_app_data_dir" => {
+            Json(std::env::var("KAM_DATA_DIR").unwrap_or_default()).into_response()
+        }
+        "test_account_proxy" => {
+            let proxy_value = payload
+                .get("proxyConfig")
+                .cloned()
+                .unwrap_or_else(|| payload.clone());
+            let proxy_config = match serde_json::from_value::<AccountProxyConfig>(proxy_value) {
+                Ok(proxy_config) => proxy_config,
+                Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+            };
+            json_result(crate::commands::proxy_cmd::test_account_proxy(proxy_config).await)
+        }
+        "get_cache_config" | "get_cache_stats" => {
+            Json(json!({ "unavailable": true })).into_response()
+        }
+        "clear_all_cache"
+        | "cleanup_expired_cache"
+        | "open_gateway_log_dir"
+        | "open_app_data_dir" => Json(json!(null)).into_response(),
+        "generate_machine_guid" => Json(generate_account_machine_id()).into_response(),
+        "set_overage_status" => {
+            let id = match arg_string(&payload, "id") {
+                Ok(id) => id,
+                Err(response) => return response,
+            };
+            let enabled = match arg_bool(&payload, "enabled") {
+                Ok(enabled) => enabled,
+                Err(response) => return response,
+            };
+            let mut store = match state.accounts.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "account store lock failed",
+                    )
+                }
+            };
+            if let Some(account) = store.accounts.iter_mut().find(|item| item.id == id) {
+                let status = if enabled { "ENABLED" } else { "DISABLED" };
+                account.usage_data.get_or_insert_with(|| json!({}))["overageConfiguration"] =
+                    json!({ "overageStatus": status });
+                let result = account.clone();
+                match save_store(&store) {
+                    Ok(()) => Json(result).into_response(),
+                    Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+                }
+            } else {
+                json_error(StatusCode::NOT_FOUND, "账号不存在")
+            }
+        }
+        unsupported => json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            format!("server mode does not support command: {unsupported}"),
+        ),
+    }
 }
 
 async fn groups_tags(headers: HeaderMap, State(state): State<AdminState>) -> Response {

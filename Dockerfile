@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
+FROM oven/bun:1 AS web-builder
+
+WORKDIR /app
+COPY . .
+RUN bun install --frozen-lockfile
+RUN bun run build:server-web
+
 FROM rust:1-bookworm AS builder
 
 RUN apt-get update \
@@ -15,6 +22,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY . .
+COPY --from=web-builder /app/src-tauri/server-web-dist ./src-tauri/server-web-dist
 
 WORKDIR /app/src-tauri
 RUN cargo build --release --bin kam-server --no-default-features --features server
@@ -34,10 +42,12 @@ RUN apt-get update \
     && chown -R kam:kam /data /home/kam
 
 COPY --from=builder /app/src-tauri/target/release/kam-server /usr/local/bin/kam-server
+COPY --from=web-builder /app/src-tauri/server-web-dist /opt/kam/server-web
 
 ENV KAM_HOST=0.0.0.0 \
     KAM_PORT=8765 \
     KAM_DATA_DIR=/data \
+    KAM_WEB_DIR=/opt/kam/server-web \
     RUST_LOG=info
 
 USER kam

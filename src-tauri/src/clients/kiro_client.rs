@@ -136,7 +136,7 @@ async fn classify_kiro_management_error(api: &str, resp: reqwest::Response) -> S
         if body_lower.contains("suspended") {
             return format!("BANNED: {body}");
         }
-        return format!("AUTH_ERROR: {api} 403: {body}");
+        return format!("{api} failed - HTTP 403: {body}");
     }
 
     if status_code == 423 {
@@ -166,7 +166,18 @@ impl KiroClient {
         _auth_method: Option<&str>,
         _provider: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        let profile_arn = effective_profile_arn(profile_arn, _provider);
+        let profile_arn = if _provider == Some("Enterprise") {
+            profile_arn
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    "Enterprise account missing profileArn; call ListAvailableProfiles first"
+                        .to_string()
+                })?
+        } else {
+            effective_profile_arn(profile_arn, _provider)
+        };
         let url = build_get_usage_limits_url(region, &profile_arn);
 
         let request = with_kiro_runtime_management_headers(
@@ -334,8 +345,9 @@ impl KiroClient {
 mod tests {
     use super::{
         build_get_usage_limits_url, build_kiro_management_host, build_kiro_management_service_url,
-        build_list_available_models_body, build_list_available_profiles_body, effective_profile_arn,
-        with_kiro_control_plane_headers, with_kiro_runtime_management_headers,
+        build_list_available_models_body, build_list_available_profiles_body,
+        effective_profile_arn, with_kiro_control_plane_headers,
+        with_kiro_runtime_management_headers,
     };
 
     #[test]

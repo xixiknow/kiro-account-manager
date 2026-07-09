@@ -165,7 +165,7 @@ pub fn resolve_profile_arn_with_fallback(
         .filter(|value| !value.is_empty());
 
     match provider {
-        Some("Enterprise") => None,
+        Some("Enterprise") => account_profile_arn.map(String::from),
         provider => account_profile_arn
             .map(String::from)
             .or_else(|| Some(resolve_default_profile_arn(provider).to_string())),
@@ -388,6 +388,32 @@ pub struct UsageResult {
     pub usage_data: serde_json::Value,
     pub is_banned: bool,
     pub is_auth_error: bool,
+    pub profile_arn: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableProfile {
+    #[serde(default)]
+    arn: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfilesResponse {
+    #[serde(default)]
+    profiles: Vec<AvailableProfile>,
+}
+
+fn first_available_profile_arn(value: serde_json::Value) -> Result<Option<String>, String> {
+    let response: ListAvailableProfilesResponse = serde_json::from_value(value)
+        .map_err(|error| format!("解析 ListAvailableProfiles 响应失败: {error}"))?;
+    Ok(response.profiles.into_iter().find_map(|profile| {
+        profile
+            .arn
+            .map(|arn| arn.trim().to_string())
+            .filter(|arn| !arn.is_empty())
+    }))
 }
 
 async fn refresh_token_by_provider_inner(
@@ -466,13 +492,30 @@ async fn get_usage_by_account_inner(
     use crate::clients::http_client::build_http_client_with_timeout_for_account;
     use crate::clients::kiro_client::KiroClient;
 
-    let ctx = resolve_kiro_call_context(account, "us-east-1");
+    let mut ctx = resolve_kiro_call_context(account, "us-east-1");
 
     let client = if use_account_proxy {
         KiroClient::from_client(build_http_client_with_timeout_for_account(account, 30, 10)?)
     } else {
         KiroClient::new()?
     };
+
+    let provider = account.provider.as_deref();
+    if provider == Some("Enterprise") && ctx.profile_arn.is_none() {
+        let profiles = client
+            .list_available_profiles(access_token, &ctx.region)
+            .await?;
+        ctx.profile_arn = first_available_profile_arn(profiles)?;
+        if ctx.profile_arn.is_none() {
+            return Err("Enterprise 账号没有可用 profileArn".to_string());
+        }
+        ctx.region = crate::clients::http_client::resolve_kiro_upstream_region(
+            ctx.profile_arn.as_deref(),
+            account.region.as_deref(),
+            &ctx.region,
+        );
+    }
+
     let usage_call = client
         .get_usage_limits(
             access_token,
@@ -480,13 +523,14 @@ async fn get_usage_by_account_inner(
             &ctx.region,
             ctx.profile_arn.as_deref(),
             account.auth_method.as_deref(),
-            account.provider.as_deref(),
+            provider,
         )
         .await;
 
     // 如果 getUsageLimits 成功，额外调用 ListAvailableModels 检测封禁
     // 因为某些封禁状态下 getUsageLimits 会正常返回，但 ListAvailableModels 会返回 403
     let mut result = parse_usage_result(usage_call)?;
+    result.profile_arn.clone_from(&ctx.profile_arn);
 
     if !result.is_banned && ctx.profile_arn.is_some() {
         match client
@@ -561,6 +605,7 @@ pub async fn get_enterprise_usage_with_region_probe(
                 usage_data,
                 is_banned: false,
                 is_auth_error: false,
+                profile_arn: None,
             },
             region,
         )),
@@ -569,6 +614,7 @@ pub async fn get_enterprise_usage_with_region_probe(
                 usage_data: serde_json::Value::Null,
                 is_banned: true,
                 is_auth_error: false,
+                profile_arn: None,
             },
             String::new(),
         )),
@@ -577,6 +623,7 @@ pub async fn get_enterprise_usage_with_region_probe(
                 usage_data: serde_json::Value::Null,
                 is_banned: false,
                 is_auth_error: true,
+                profile_arn: None,
             },
             String::new(),
         )),
@@ -591,17 +638,20 @@ fn parse_usage_result(result: Result<serde_json::Value, String>) -> Result<Usage
             usage_data, // 直接使用 JSON Value
             is_banned: false,
             is_auth_error: false,
+            profile_arn: None,
         }),
         Err(e) if e.starts_with("BANNED:") => Ok(UsageResult {
             usage_data: serde_json::Value::Null,
             is_banned: true,
             is_auth_error: false,
+            profile_arn: None,
         }),
-        // 401 或认证相关错误（包括 403 + token invalid）
+        // 只把明确认证错误视为 token 失效；profileArn 等 403 不应误伤账号状态。
         Err(e) if is_auth_error_message(&e) => Ok(UsageResult {
             usage_data: serde_json::Value::Null,
             is_banned: false,
             is_auth_error: true,
+            profile_arn: None,
         }),
         // 其他错误直接抛出
         Err(e) => Err(e),
@@ -611,10 +661,9 @@ fn parse_usage_result(result: Result<serde_json::Value, String>) -> Result<Usage
 pub fn is_auth_error_message(error: &str) -> bool {
     let lower = error.to_lowercase();
     error.starts_with("AUTH_ERROR:")
-        || error.contains("401")
-        || error.contains("Unauthorized")
-        || lower.contains("expired")
-        || lower.contains("invalid")
+        || error.contains("HTTP 401")
+        || error.contains(" 401:")
+        || lower.contains("unauthorized")
 }
 pub fn calc_expires_at(expires_in: i64) -> String {
     let now = chrono::Local::now();
@@ -947,12 +996,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_profile_arn_with_fallback_omits_enterprise_profile_arn() {
+    fn resolve_profile_arn_with_fallback_keeps_enterprise_account_profile_arn() {
         assert_eq!(
             resolve_profile_arn_with_fallback(
-                Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/IGNORED"),
+                Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/ENTERPRISE"),
                 Some("Enterprise"),
-            ),
+            )
+            .as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/ENTERPRISE")
+        );
+        assert_eq!(
+            resolve_profile_arn_with_fallback(None, Some("Enterprise")),
             None
         );
     }
@@ -984,13 +1038,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_profile_arn_from_candidates_omits_enterprise_even_with_candidates() {
+    fn resolve_profile_arn_from_candidates_prefers_enterprise_candidates_without_default() {
         assert_eq!(
             resolve_profile_arn_from_candidates(
                 Some("arn:aws:codewhisperer:us-west-2:123456789012:profile/REFRESHED"),
                 Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/ACCOUNT"),
                 Some("Enterprise"),
-            ),
+            )
+            .as_deref(),
+            Some("arn:aws:codewhisperer:us-west-2:123456789012:profile/REFRESHED")
+        );
+        assert_eq!(
+            resolve_profile_arn_from_candidates(None, None, Some("Enterprise")),
             None
         );
     }
@@ -1037,6 +1096,19 @@ mod tests {
 
         assert!(!machine_id.trim().is_empty());
         assert_eq!(account.machine_id.as_deref(), Some(machine_id.as_str()));
+    }
+
+    #[test]
+    fn auth_error_detection_does_not_treat_profile_403_invalid_body_as_token_invalid() {
+        assert!(super::is_auth_error_message(
+            "AUTH_ERROR: refresh token expired"
+        ));
+        assert!(super::is_auth_error_message(
+            "getUsageLimits failed - HTTP 401: Unauthorized"
+        ));
+        assert!(!super::is_auth_error_message(
+            r#"getUsageLimits failed - HTTP 403: {"message":"Invalid token"}"#
+        ));
     }
 
     #[test]
