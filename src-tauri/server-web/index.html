@@ -378,6 +378,27 @@
         font-size: 20px;
       }
 
+      .auth-band {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.025);
+        padding: 14px;
+        display: grid;
+        gap: 12px;
+      }
+
+      .auth-band-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .auth-band-head strong {
+        display: block;
+        font-size: 16px;
+      }
+
       .code-block {
         display: block;
         width: 100%;
@@ -552,7 +573,7 @@
 
           <section v-if="view === 'desktopOAuth'" class="grid two">
             <div class="panel">
-              <div class="panel-head"><h3>在线登录</h3><span class="chip ok">Social OAuth</span></div>
+              <div class="panel-head"><h3>在线登录</h3><span class="chip ok">OAuth + AWS SSO</span></div>
               <div class="panel-body grid">
                 <div class="provider-grid">
                   <div class="provider-card" v-for="provider in onlineLogin.providers" :key="provider.id">
@@ -565,10 +586,36 @@
                     </button>
                   </div>
                 </div>
+                <div class="auth-band">
+                  <div class="auth-band-head">
+                    <div>
+                      <span class="muted">AWS Builder ID</span>
+                      <strong>Device Code</strong>
+                    </div>
+                    <button class="primary" :disabled="onlineLogin.busyProvider === 'BuilderId'" @click="startIdcLogin('BuilderId')">
+                      {{ onlineLogin.busyProvider === 'BuilderId' ? '等待中' : '打开验证' }}
+                    </button>
+                  </div>
+                </div>
+                <div class="auth-band">
+                  <div class="auth-band-head">
+                    <div>
+                      <span class="muted">IAM Identity Center</span>
+                      <strong>Enterprise / IAM</strong>
+                    </div>
+                    <button class="primary" :disabled="onlineLogin.busyProvider === 'Enterprise'" @click="startIdcLogin('Enterprise')">
+                      {{ onlineLogin.busyProvider === 'Enterprise' ? '等待中' : '打开验证' }}
+                    </button>
+                  </div>
+                  <div class="form-grid">
+                    <label>Start URL <input v-model="onlineLogin.idc.startUrl" placeholder="https://d-1234567890.awsapps.com/start" /></label>
+                    <label>Region <input v-model="onlineLogin.idc.region" /></label>
+                  </div>
+                </div>
                 <div class="notice" v-if="!status.publicBaseUrl">
                   当前会从 Nginx 转发头推导公网地址；生产环境建议设置 KAM_PUBLIC_BASE_URL=https://your.domain，避免 OAuth callback 域名不一致。
                 </div>
-                <label>Callback URL <code class="code-block">{{ onlineLogin.last?.redirectUri || callbackPreview }}</code></label>
+                <label>授权入口 <code class="code-block">{{ onlineLogin.last?.redirectUri || callbackPreview }}</code></label>
               </div>
             </div>
             <div class="panel">
@@ -578,14 +625,23 @@
                   <span class="muted">最近授权</span>
                   <strong>{{ onlineLogin.last?.provider || 'Ready' }}</strong>
                 </div>
+                <div class="auth-band" v-if="onlineLogin.idc.last">
+                  <div class="split">
+                    <span class="chip">{{ onlineLogin.idc.last.provider }}</span>
+                    <span class="chip warn">{{ onlineLogin.idc.last.userCode }}</span>
+                    <span class="chip">{{ onlineLogin.idc.pollStatus || 'pending' }}</span>
+                    <button @click="openAuthUrl(onlineLogin.idc.last.verificationUriComplete)">打开入口</button>
+                  </div>
+                  <code class="code-block">{{ onlineLogin.idc.last.verificationUriComplete }}</code>
+                </div>
                 <div class="table-wrap" v-if="onlineLogin.pending.length">
                   <table>
-                    <thead><tr><th>平台</th><th>剩余</th><th>Callback</th></tr></thead>
+                    <thead><tr><th>平台</th><th>剩余</th><th>入口</th></tr></thead>
                     <tbody>
                       <tr v-for="item in onlineLogin.pending" :key="item.state">
                         <td>{{ item.provider }}</td>
                         <td>{{ item.expiresInSeconds }}s</td>
-                        <td>{{ item.redirectUri }}</td>
+                        <td>{{ item.userCode || item.redirectUri }}</td>
                       </tr>
                     </tbody>
                   </table>
@@ -777,6 +833,12 @@
               busyProvider: "",
               last: null,
               pending: [],
+              idc: {
+                region: "us-east-1",
+                startUrl: "",
+                last: null,
+                pollStatus: "",
+              },
             },
             toast: { show: false, message: "" },
           };
@@ -916,6 +978,77 @@
               this.onlineLogin.busyProvider = "";
             }
           },
+          openAuthUrl(url) {
+            if (!url) return;
+            const popup = window.open("about:blank", "kam-auth-window", "width=1040,height=820");
+            if (!popup) return this.notify("弹窗被拦截，请复制授权入口打开");
+            popup.opener = null;
+            popup.location.href = url;
+          },
+          async startIdcLogin(provider) {
+            this.onlineLogin.busyProvider = provider;
+            try {
+              const payload = {
+                provider,
+                region: this.onlineLogin.idc.region || "us-east-1",
+              };
+              if (provider === "Enterprise") {
+                payload.startUrl = this.onlineLogin.idc.startUrl;
+              }
+              const result = await this.api("/admin/api/online-login/idc/begin", {
+                method: "POST",
+                body: JSON.stringify(payload),
+              });
+              this.onlineLogin.last = {
+                provider: result.provider,
+                redirectUri: result.verificationUriComplete,
+              };
+              this.onlineLogin.idc.last = result;
+              this.onlineLogin.idc.pollStatus = "pending";
+              await this.loadPending();
+              const popup = window.open("about:blank", "kam-aws-login", "width=1040,height=820");
+              if (!popup) {
+                this.notify("弹窗被拦截，请复制授权入口打开");
+              } else {
+                popup.opener = null;
+                popup.location.href = result.verificationUriComplete;
+                this.notify(`${result.provider} AWS 验证已打开`);
+              }
+              this.scheduleIdcPoll(result);
+            } catch (error) {
+              this.notify(error.message || "AWS 登录启动失败");
+            } finally {
+              this.onlineLogin.busyProvider = "";
+            }
+          },
+          scheduleIdcPoll(login) {
+            window.clearTimeout(this.idcPollTimer);
+            const delay = Math.max(3, login.intervalSeconds || 5) * 1000;
+            this.idcPollTimer = window.setTimeout(() => this.pollIdcLogin(login), delay);
+          },
+          async pollIdcLogin(login) {
+            try {
+              const result = await this.api(`/admin/api/online-login/idc/poll?state=${encodeURIComponent(login.state)}`);
+              this.onlineLogin.idc.pollStatus = result.status;
+              if (result.status === "complete") {
+                this.notify(result.accountDisplayId ? `AWS 登录成功：${result.accountDisplayId}` : "AWS 登录成功");
+                this.onlineLogin.idc.last = null;
+                await Promise.allSettled([this.loadAccounts(), this.loadPending(), this.loadStatus()]);
+                this.view = "accounts";
+                return;
+              }
+              if (result.status === "error") {
+                this.notify(result.message || "AWS 登录失败");
+                await this.loadPending();
+                return;
+              }
+              await this.loadPending();
+              this.scheduleIdcPoll({ ...login, intervalSeconds: result.intervalSeconds });
+            } catch (error) {
+              this.notify(error.message || "AWS 登录轮询失败");
+              await this.loadPending().catch(() => null);
+            }
+          },
           async loadPending() {
             this.onlineLogin.pending = await this.api("/admin/api/online-login/pending");
           },
@@ -978,6 +1111,7 @@
         beforeUnmount() {
           window.removeEventListener("message", this.handleOnlineLoginMessage);
           if (this.onlineLoginChannel) this.onlineLoginChannel.close();
+          window.clearTimeout(this.idcPollTimer);
         },
       }).mount("#app");
     </script>

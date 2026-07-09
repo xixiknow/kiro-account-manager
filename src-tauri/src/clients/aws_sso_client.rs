@@ -15,6 +15,7 @@ pub const GRANT_SCOPES: &[&str] = &[
     "codewhisperer:transformations",
     "codewhisperer:taskassist",
 ];
+pub const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// AWS SSO OIDC 客户端
 pub struct AWSSSOClient {
@@ -58,6 +59,22 @@ pub struct TokenResponse {
     pub issued_token_type: Option<String>,
     #[serde(rename = "originSessionId")]
     pub origin_session_id: Option<String>,
+}
+
+/// Device Authorization 响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceAuthorizationResponse {
+    #[serde(rename = "deviceCode")]
+    pub device_code: String,
+    #[serde(rename = "userCode")]
+    pub user_code: String,
+    #[serde(rename = "verificationUri")]
+    pub verification_uri: String,
+    #[serde(rename = "verificationUriComplete")]
+    pub verification_uri_complete: Option<String>,
+    #[serde(rename = "expiresIn")]
+    pub expires_in: i64,
+    pub interval: i64,
 }
 
 impl AWSSSOClient {
@@ -140,6 +157,136 @@ impl AWSSSOClient {
         println!("[AWS SSO] Client registered successfully");
 
         serde_json::from_str(&text).map_err(|e| format!("Failed to parse client registration: {e}"))
+    }
+
+    /// 注册客户端（Device Authorization Flow，适合 headless/server 登录）
+    pub async fn register_device_client(
+        &self,
+        issuer_url: &str,
+        has_user_provided_input: bool,
+    ) -> Result<ClientRegistration, String> {
+        let url = format!("{}/client/register", self.base_url);
+
+        let scopes: Vec<String> = GRANT_SCOPES
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+
+        let body = serde_json::json!({
+            "clientName": "Kiro IDE",
+            "clientType": "public",
+            "scopes": scopes,
+            "grantTypes": [DEVICE_CODE_GRANT_TYPE, "refresh_token"],
+            "issuerUrl": issuer_url
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("dns error") || e.to_string().contains("connection") {
+                    format!("无法连接到 AWS SSO 服务。\n\n可能的原因：\n1. Region 选择错误（请确认您的 IAM Identity Center 所在的 Region）\n2. 网络连接问题\n3. Start URL 格式错误\n\n错误详情: {e}")
+                } else {
+                    format!("Device client registration failed: {e}")
+                }
+            })?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            if has_user_provided_input && status.as_u16() == 400 {
+                if text.to_lowercase().contains("invalid start url provided") {
+                    return Err("Start URL 无效。请检查您输入的 IAM Identity Center Start URL 是否正确。\n\n示例格式：https://d-1234567890.awsapps.com/start".to_string());
+                }
+                return Err(format!("注册 Device Client 失败 (400 Bad Request)\n\n可能的原因：\n1. Region 选择错误（请确认您的 IAM Identity Center 所在的 Region）\n2. Start URL 格式错误\n\n错误详情: {text}"));
+            }
+            return Err(format!(
+                "Device client registration failed ({status}): {text}"
+            ));
+        }
+
+        serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse device client registration: {e}"))
+    }
+
+    /// 开始 Device Authorization，返回用户需要打开的验证链接和 user code
+    pub async fn start_device_authorization(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        start_url: &str,
+    ) -> Result<DeviceAuthorizationResponse, String> {
+        let url = format!("{}/device_authorization", self.base_url);
+        let body = serde_json::json!({
+            "clientId": client_id,
+            "clientSecret": client_secret,
+            "startUrl": start_url
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Device authorization failed: {e}"))?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Err(format!("Device authorization failed ({status}): {text}"));
+        }
+
+        serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse device authorization response: {e}"))
+    }
+
+    /// 使用 Device Code 轮询 Token
+    pub async fn create_token_with_device_code(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        device_code: &str,
+    ) -> Result<TokenResponse, String> {
+        let url = format!("{}/token", self.base_url);
+        let scopes: Vec<String> = GRANT_SCOPES
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+
+        let body = serde_json::json!({
+            "clientId": client_id,
+            "clientSecret": client_secret,
+            "grantType": DEVICE_CODE_GRANT_TYPE,
+            "deviceCode": device_code,
+            "scope": scopes
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Device token creation failed: {e}"))?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Err(format!("Device token creation failed ({status}): {text}"));
+        }
+
+        serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse device token response: {e}"))
     }
 
     /// 使用授权码交换 Token

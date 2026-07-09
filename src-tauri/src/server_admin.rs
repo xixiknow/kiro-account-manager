@@ -19,16 +19,23 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     auth::{auth_social, providers::SocialTokenResponse},
-    clients::kiro_auth_client::KiroAuthServiceClient,
+    clients::{
+        aws_sso_client::{
+            AWSSSOClient, ClientRegistration, DeviceAuthorizationResponse, TokenResponse,
+        },
+        kiro_auth_client::KiroAuthServiceClient,
+    },
     commands::app_settings_cmd::{self, AppSettings},
     commands::common::{
         calc_expires_at, extract_user_info, find_existing_account_idx, generate_account_machine_id,
-        get_usage_by_provider_with_machine_id, save_store, update_account_status,
+        get_usage_by_provider_with_machine_id, resolve_idc_client_id_hash, save_store,
+        update_account_status, KIRO_BUILDER_ID_START_URL,
     },
     commands::kiro_settings_cmd,
     core::account::{Account, AccountStore, GroupTagData, GroupTagStore},
     gateway::{self, log_store, GatewayConfig, GatewayRequestLogEntry, GatewayStatus},
     services::session_storage::SessionStorage,
+    utils::client_id_hash::normalize_start_url,
 };
 
 const ADMIN_TOKEN_ENV: &str = "KAM_ADMIN_TOKEN";
@@ -47,6 +54,7 @@ pub struct AdminState {
     accounts: Arc<Mutex<AccountStore>>,
     group_tags: Arc<Mutex<GroupTagStore>>,
     online_logins: Arc<Mutex<HashMap<String, PendingOnlineLogin>>>,
+    online_idc_logins: Arc<Mutex<HashMap<String, PendingIdcDeviceLogin>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +95,17 @@ struct PendingOnlineLogin {
     created_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct PendingIdcDeviceLogin {
+    provider: String,
+    region: String,
+    start_url: String,
+    machine_id: String,
+    client_registration: ClientRegistration,
+    device_authorization: DeviceAuthorizationResponse,
+    created_at: Instant,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BeginSocialLoginRequest {
@@ -106,11 +125,53 @@ struct BeginSocialLoginResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingOnlineLoginInfo {
+    kind: String,
     state: String,
     provider: String,
     redirect_uri: String,
+    user_code: Option<String>,
+    verification_uri_complete: Option<String>,
     age_seconds: u64,
     expires_in_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeginIdcDeviceLoginRequest {
+    provider: String,
+    region: Option<String>,
+    start_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BeginIdcDeviceLoginResponse {
+    state: String,
+    provider: String,
+    region: String,
+    start_url: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    user_code: String,
+    expires_in_seconds: u64,
+    interval_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdcPollQuery {
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdcPollResponse {
+    state: String,
+    provider: String,
+    status: String,
+    message: String,
+    account_display_id: Option<String>,
+    expires_in_seconds: u64,
+    interval_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +202,14 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/admin/api/online-login/social/begin",
             post(begin_social_online_login),
+        )
+        .route(
+            "/admin/api/online-login/idc/begin",
+            post(begin_idc_device_login),
+        )
+        .route(
+            "/admin/api/online-login/idc/poll",
+            get(poll_idc_device_login),
         )
         .route("/admin/api/online-login/pending", get(online_login_pending))
         .route("/admin/api/status", get(status))
@@ -191,6 +260,7 @@ impl AdminState {
             accounts: Arc::new(Mutex::new(AccountStore::new())),
             group_tags: Arc::new(Mutex::new(GroupTagStore::new())),
             online_logins: Arc::new(Mutex::new(HashMap::new())),
+            online_idc_logins: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -261,6 +331,62 @@ fn normalize_social_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
+fn normalize_idc_provider(provider: &str) -> Option<&'static str> {
+    match provider
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-', '_'], "")
+        .as_str()
+    {
+        "builderid" | "awsbuilderid" => Some("BuilderId"),
+        "iam" | "enterprise" | "iamidentitycenter" | "identitycenter" | "awsiamidentitycenter" => {
+            Some("Enterprise")
+        }
+        _ => None,
+    }
+}
+
+fn resolve_idc_start_url(provider: &str, start_url: Option<String>) -> Result<String, String> {
+    if provider == "BuilderId" {
+        return Ok(KIRO_BUILDER_ID_START_URL.to_string());
+    }
+
+    start_url
+        .map(|url| normalize_start_url(&url))
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| {
+            "IAM Identity Center 登录需要填写 Start URL，例如 https://d-1234567890.awsapps.com/start"
+                .to_string()
+        })
+}
+
+fn resolve_idc_region(region: Option<String>) -> String {
+    region
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "us-east-1".to_string())
+}
+
+fn resolve_idc_account_identity(
+    provider: &str,
+    email: Option<String>,
+    user_id: Option<String>,
+    refresh_token: &str,
+) -> Result<String, String> {
+    if provider == "Enterprise" {
+        email
+            .or(user_id)
+            .ok_or_else(|| "IAM Identity Center 账号缺少 userId 或 email".to_string())
+    } else {
+        Ok(email.or(user_id).unwrap_or_else(|| {
+            format!(
+                "builderid_{}",
+                refresh_token.chars().take(8).collect::<String>()
+            )
+        }))
+    }
+}
+
 fn first_forwarded_value(value: &str) -> Option<String> {
     value
         .split(',')
@@ -296,6 +422,37 @@ fn resolve_public_base_url(headers: &HeaderMap, state: &AdminState) -> Result<St
 
 fn cleanup_expired_online_logins(logins: &mut HashMap<String, PendingOnlineLogin>) {
     logins.retain(|_, pending| pending.created_at.elapsed() < ONLINE_LOGIN_TTL);
+}
+
+fn cleanup_expired_idc_logins(logins: &mut HashMap<String, PendingIdcDeviceLogin>) {
+    logins.retain(|_, pending| pending.created_at.elapsed() < ONLINE_LOGIN_TTL);
+}
+
+fn online_login_remaining(created_at: Instant, upstream_expires_in: Option<i64>) -> u64 {
+    let ttl = upstream_expires_in
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(ONLINE_LOGIN_TTL)
+        .min(ONLINE_LOGIN_TTL);
+    ttl.as_secs().saturating_sub(created_at.elapsed().as_secs())
+}
+
+fn idc_poll_interval(device_authorization: &DeviceAuthorizationResponse) -> u64 {
+    u64::try_from(device_authorization.interval)
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or(5)
+}
+
+fn is_idc_poll_pending_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("authorization_pending") || lower.contains("slow_down")
+}
+
+fn is_idc_poll_expired_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("expired_token") || lower.contains("expiredtoken") || lower.contains("expired")
 }
 
 fn escape_html(value: &str) -> String {
@@ -449,6 +606,218 @@ async fn begin_social_online_login(
     .into_response()
 }
 
+async fn begin_idc_device_login(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+    Json(payload): Json<BeginIdcDeviceLoginRequest>,
+) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    let provider = match normalize_idc_provider(&payload.provider) {
+        Some(provider) => provider.to_string(),
+        None => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "provider must be BuilderId, IAM, or Enterprise",
+            )
+        }
+    };
+    let region = resolve_idc_region(payload.region);
+    let start_url = match resolve_idc_start_url(&provider, payload.start_url) {
+        Ok(start_url) => start_url,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+    };
+
+    let sso_client = AWSSSOClient::new(&region);
+    let client_registration = match sso_client
+        .register_device_client(&start_url, provider == "Enterprise")
+        .await
+    {
+        Ok(registration) => registration,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+    };
+    let device_authorization = match sso_client
+        .start_device_authorization(
+            &client_registration.client_id,
+            &client_registration.client_secret,
+            &start_url,
+        )
+        .await
+    {
+        Ok(device_authorization) => device_authorization,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+    };
+
+    let state_id = uuid::Uuid::new_v4().to_string();
+    let machine_id = generate_account_machine_id();
+    let verification_uri_complete = device_authorization
+        .verification_uri_complete
+        .clone()
+        .unwrap_or_else(|| device_authorization.verification_uri.clone());
+
+    let mut logins = match state.online_idc_logins.lock() {
+        Ok(logins) => logins,
+        Err(_) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "online IdC login store lock failed",
+            )
+        }
+    };
+    cleanup_expired_idc_logins(&mut logins);
+    let interval_seconds = idc_poll_interval(&device_authorization);
+    logins.insert(
+        state_id.clone(),
+        PendingIdcDeviceLogin {
+            provider: provider.clone(),
+            region: region.clone(),
+            start_url: start_url.clone(),
+            machine_id,
+            client_registration,
+            device_authorization: device_authorization.clone(),
+            created_at: Instant::now(),
+        },
+    );
+
+    Json(BeginIdcDeviceLoginResponse {
+        state: state_id,
+        provider,
+        region,
+        start_url,
+        verification_uri: device_authorization.verification_uri,
+        verification_uri_complete,
+        user_code: device_authorization.user_code,
+        expires_in_seconds: online_login_remaining(
+            Instant::now(),
+            Some(device_authorization.expires_in),
+        ),
+        interval_seconds,
+    })
+    .into_response()
+}
+
+async fn poll_idc_device_login(
+    headers: HeaderMap,
+    State(state): State<AdminState>,
+    Query(query): Query<IdcPollQuery>,
+) -> Response {
+    if let Err(response) = require_auth(&headers, &state) {
+        return response;
+    }
+
+    let state_id = query.state.trim().to_string();
+    if state_id.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "state is required");
+    }
+
+    let pending = {
+        let mut logins = match state.online_idc_logins.lock() {
+            Ok(logins) => logins,
+            Err(_) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "online IdC login store lock failed",
+                )
+            }
+        };
+        cleanup_expired_idc_logins(&mut logins);
+        logins.get(&state_id).cloned()
+    };
+
+    let Some(pending) = pending else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "online IdC login not found or expired",
+        );
+    };
+
+    if online_login_remaining(
+        pending.created_at,
+        Some(pending.device_authorization.expires_in),
+    ) == 0
+    {
+        if let Ok(mut logins) = state.online_idc_logins.lock() {
+            logins.remove(&state_id);
+        }
+        return Json(IdcPollResponse {
+            state: state_id,
+            provider: pending.provider,
+            status: "error".to_string(),
+            message: "AWS 登录验证码已过期，请重新发起登录。".to_string(),
+            account_display_id: None,
+            expires_in_seconds: 0,
+            interval_seconds: idc_poll_interval(&pending.device_authorization),
+        })
+        .into_response();
+    }
+
+    let sso_client = AWSSSOClient::new(&pending.region);
+    let token_response = match sso_client
+        .create_token_with_device_code(
+            &pending.client_registration.client_id,
+            &pending.client_registration.client_secret,
+            &pending.device_authorization.device_code,
+        )
+        .await
+    {
+        Ok(token_response) => token_response,
+        Err(error) if is_idc_poll_pending_error(&error) => {
+            return Json(IdcPollResponse {
+                state: state_id,
+                provider: pending.provider,
+                status: "pending".to_string(),
+                message: "等待 AWS 授权完成。".to_string(),
+                account_display_id: None,
+                expires_in_seconds: online_login_remaining(
+                    pending.created_at,
+                    Some(pending.device_authorization.expires_in),
+                ),
+                interval_seconds: idc_poll_interval(&pending.device_authorization),
+            })
+            .into_response()
+        }
+        Err(error) if is_idc_poll_expired_error(&error) => {
+            if let Ok(mut logins) = state.online_idc_logins.lock() {
+                logins.remove(&state_id);
+            }
+            return Json(IdcPollResponse {
+                state: state_id,
+                provider: pending.provider,
+                status: "error".to_string(),
+                message: "AWS 登录验证码已过期，请重新发起登录。".to_string(),
+                account_display_id: None,
+                expires_in_seconds: 0,
+                interval_seconds: idc_poll_interval(&pending.device_authorization),
+            })
+            .into_response();
+        }
+        Err(error) => {
+            return json_error(StatusCode::BAD_REQUEST, error);
+        }
+    };
+
+    match finish_idc_device_login(&state, pending.clone(), token_response).await {
+        Ok(account) => {
+            if let Ok(mut logins) = state.online_idc_logins.lock() {
+                logins.remove(&state_id);
+            }
+            Json(IdcPollResponse {
+                state: state_id,
+                provider: pending.provider,
+                status: "complete".to_string(),
+                message: "AWS 在线登录成功。".to_string(),
+                account_display_id: Some(account.get_display_id()),
+                expires_in_seconds: 0,
+                interval_seconds: idc_poll_interval(&pending.device_authorization),
+            })
+            .into_response()
+        }
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+    }
+}
+
 async fn online_login_pending(headers: HeaderMap, State(state): State<AdminState>) -> Response {
     if let Err(response) = require_auth(&headers, &state) {
         return response;
@@ -465,19 +834,54 @@ async fn online_login_pending(headers: HeaderMap, State(state): State<AdminState
     };
     cleanup_expired_online_logins(&mut logins);
 
-    let pending: Vec<PendingOnlineLoginInfo> = logins
+    let mut pending: Vec<PendingOnlineLoginInfo> = logins
         .iter()
         .map(|(state_id, pending)| {
             let age_seconds = pending.created_at.elapsed().as_secs();
             PendingOnlineLoginInfo {
+                kind: "social".to_string(),
                 state: state_id.clone(),
                 provider: pending.provider.clone(),
                 redirect_uri: pending.redirect_uri.clone(),
+                user_code: None,
+                verification_uri_complete: None,
                 age_seconds,
                 expires_in_seconds: ONLINE_LOGIN_TTL.as_secs().saturating_sub(age_seconds),
             }
         })
         .collect();
+
+    let mut idc_logins = match state.online_idc_logins.lock() {
+        Ok(logins) => logins,
+        Err(_) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "online IdC login store lock failed",
+            )
+        }
+    };
+    cleanup_expired_idc_logins(&mut idc_logins);
+    pending.extend(idc_logins.iter().map(|(state_id, pending)| {
+        let age_seconds = pending.created_at.elapsed().as_secs();
+        let verification_uri_complete = pending
+            .device_authorization
+            .verification_uri_complete
+            .clone()
+            .unwrap_or_else(|| pending.device_authorization.verification_uri.clone());
+        PendingOnlineLoginInfo {
+            kind: "idc".to_string(),
+            state: state_id.clone(),
+            provider: pending.provider.clone(),
+            redirect_uri: verification_uri_complete.clone(),
+            user_code: Some(pending.device_authorization.user_code.clone()),
+            verification_uri_complete: Some(verification_uri_complete),
+            age_seconds,
+            expires_in_seconds: online_login_remaining(
+                pending.created_at,
+                Some(pending.device_authorization.expires_in),
+            ),
+        }
+    }));
     Json(pending).into_response()
 }
 
@@ -646,6 +1050,121 @@ async fn finish_social_online_login(
         account.user_id = user_id;
         account.id_token = token_response.id_token.clone();
         account.profile_arn = token_response.profile_arn.clone();
+        account.usage_data = Some(usage_result.usage_data);
+        account.machine_id = Some(pending.machine_id.clone());
+        update_account_status(
+            &mut account,
+            usage_result.is_banned,
+            usage_result.is_auth_error,
+        );
+        store.accounts.insert(0, account.clone());
+        account
+    };
+
+    save_store(&store)?;
+    Ok(account)
+}
+
+async fn finish_idc_device_login(
+    state: &AdminState,
+    pending: PendingIdcDeviceLogin,
+    token_response: TokenResponse,
+) -> Result<Account, String> {
+    let usage_result = get_usage_by_provider_with_machine_id(
+        &pending.provider,
+        &token_response.access_token,
+        &pending.machine_id,
+    )
+    .await?;
+
+    if usage_result.is_banned {
+        return Err("BANNED: 账号已被封禁".to_string());
+    }
+
+    let (new_email, user_id) = extract_user_info(&usage_result.usage_data);
+    let display_id = resolve_idc_account_identity(
+        &pending.provider,
+        new_email.clone(),
+        user_id.clone(),
+        &token_response.refresh_token,
+    )?;
+    let account_start_url = if pending.provider == "Enterprise" {
+        Some(pending.start_url.clone())
+    } else {
+        None
+    };
+    let client_id_hash = resolve_idc_client_id_hash(
+        &pending.provider,
+        None,
+        account_start_url
+            .as_deref()
+            .or(Some(pending.start_url.as_str())),
+    )?;
+
+    let mut store = state
+        .accounts
+        .lock()
+        .map_err(|_| "account store lock failed".to_string())?;
+    let existing_idx = find_existing_account_idx(
+        &store.accounts,
+        new_email.as_ref(),
+        &pending.provider,
+        &token_response.refresh_token,
+        user_id.as_ref(),
+    );
+
+    let account = if let Some(idx) = existing_idx {
+        let existing = &mut store.accounts[idx];
+        existing.access_token = Some(token_response.access_token.clone());
+        existing.refresh_token = Some(token_response.refresh_token.clone());
+        if pending.provider == "Enterprise" || new_email.is_some() {
+            existing.email.clone_from(&new_email);
+        }
+        existing.user_id.clone_from(&user_id);
+        existing.provider = Some(pending.provider.clone());
+        existing.auth_method = Some("IdC".to_string());
+        existing.expires_at = Some(calc_expires_at(token_response.expires_in));
+        existing.client_id = Some(pending.client_registration.client_id.clone());
+        existing.client_secret = Some(pending.client_registration.client_secret.clone());
+        existing.client_id_hash = Some(client_id_hash.clone());
+        existing.region = Some(pending.region.clone());
+        existing.start_url = account_start_url.clone();
+        existing.sso_session_id = token_response.aws_sso_app_session_id.clone();
+        existing.id_token = token_response.id_token.clone();
+        existing.profile_arn = None;
+        existing.usage_data = Some(usage_result.usage_data);
+        if existing
+            .machine_id
+            .as_ref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            existing.machine_id = Some(pending.machine_id.clone());
+        }
+        update_account_status(existing, usage_result.is_banned, usage_result.is_auth_error);
+        existing.clone()
+    } else {
+        let mut account = if pending.provider == "Enterprise" {
+            Account::new_enterprise(display_id, "Kiro IAM Identity Center 账号".to_string())
+        } else {
+            Account::new(display_id, "Kiro BuilderId 账号".to_string())
+        };
+        if pending.provider == "Enterprise" || new_email.is_some() {
+            account.email = new_email;
+        }
+        account.access_token = Some(token_response.access_token.clone());
+        account.refresh_token = Some(token_response.refresh_token.clone());
+        account.provider = Some(pending.provider.clone());
+        account.auth_method = Some("IdC".to_string());
+        account.user_id = user_id;
+        account.expires_at = Some(calc_expires_at(token_response.expires_in));
+        account.client_id = Some(pending.client_registration.client_id.clone());
+        account.client_secret = Some(pending.client_registration.client_secret.clone());
+        account.client_id_hash = Some(client_id_hash);
+        account.region = Some(pending.region.clone());
+        account.start_url = account_start_url;
+        account.sso_session_id = token_response.aws_sso_app_session_id.clone();
+        account.id_token = token_response.id_token.clone();
+        account.profile_arn = None;
         account.usage_data = Some(usage_result.usage_data);
         account.machine_id = Some(pending.machine_id.clone());
         update_account_status(
