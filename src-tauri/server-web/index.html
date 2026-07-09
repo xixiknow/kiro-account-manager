@@ -63,6 +63,11 @@
         border-color: var(--cyan);
       }
 
+      button:disabled {
+        cursor: wait;
+        opacity: 0.58;
+      }
+
       button.primary {
         border-color: transparent;
         background: var(--green);
@@ -349,6 +354,53 @@
         flex-wrap: wrap;
       }
 
+      .provider-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .provider-card {
+        min-height: 132px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background:
+          linear-gradient(135deg, rgba(102, 212, 142, 0.08), transparent 52%),
+          #101719;
+        padding: 14px;
+        display: grid;
+        align-content: space-between;
+        gap: 14px;
+      }
+
+      .provider-card strong {
+        display: block;
+        font-size: 20px;
+      }
+
+      .code-block {
+        display: block;
+        width: 100%;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #080c0e;
+        color: #d7ece5;
+        padding: 11px 12px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+
+      .notice {
+        border: 1px solid rgba(98, 198, 216, 0.36);
+        border-radius: 8px;
+        background: rgba(98, 198, 216, 0.08);
+        padding: 12px;
+        color: #cfecef;
+        line-height: 1.6;
+      }
+
       .toast {
         position: fixed;
         right: 20px;
@@ -392,6 +444,7 @@
 
         .grid.two,
         .grid.three,
+        .provider-grid,
         .form-grid {
           grid-template-columns: 1fr;
         }
@@ -499,16 +552,45 @@
 
           <section v-if="view === 'desktopOAuth'" class="grid two">
             <div class="panel">
-              <div class="panel-head"><h3>登录授权</h3><span class="chip warn">Server Mode</span></div>
+              <div class="panel-head"><h3>在线登录</h3><span class="chip ok">Social OAuth</span></div>
               <div class="panel-body grid">
-                <div class="metric"><span class="muted">JSON 导入</span><strong>Ready</strong></div>
-                <div class="metric"><span class="muted">Kiro CLI 导入</span><strong>{{ about.mode || 'server' }}</strong></div>
+                <div class="provider-grid">
+                  <div class="provider-card" v-for="provider in onlineLogin.providers" :key="provider.id">
+                    <div>
+                      <span class="muted">{{ provider.id }}</span>
+                      <strong>{{ provider.label }}</strong>
+                    </div>
+                    <button class="primary" :disabled="onlineLogin.busyProvider === provider.id" @click="startOnlineLogin(provider.id)">
+                      {{ onlineLogin.busyProvider === provider.id ? '启动中' : '打开授权' }}
+                    </button>
+                  </div>
+                </div>
+                <div class="notice" v-if="!status.publicBaseUrl">
+                  当前会从 Nginx 转发头推导公网地址；生产环境建议设置 KAM_PUBLIC_BASE_URL=https://your.domain，避免 OAuth callback 域名不一致。
+                </div>
+                <label>Callback URL <code class="code-block">{{ onlineLogin.last?.redirectUri || callbackPreview }}</code></label>
               </div>
             </div>
             <div class="panel">
-              <div class="panel-head"><h3>授权状态</h3></div>
+              <div class="panel-head"><h3>授权状态</h3><button @click="loadPending">刷新</button></div>
               <div class="panel-body grid">
-                <div class="empty">远程 OAuth 登录需要服务端回调域名，当前版本先使用账号 JSON / CLI 数据导入。</div>
+                <div class="metric">
+                  <span class="muted">最近授权</span>
+                  <strong>{{ onlineLogin.last?.provider || 'Ready' }}</strong>
+                </div>
+                <div class="table-wrap" v-if="onlineLogin.pending.length">
+                  <table>
+                    <thead><tr><th>平台</th><th>剩余</th><th>Callback</th></tr></thead>
+                    <tbody>
+                      <tr v-for="item in onlineLogin.pending" :key="item.state">
+                        <td>{{ item.provider }}</td>
+                        <td>{{ item.expiresInSeconds }}s</td>
+                        <td>{{ item.redirectUri }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div v-else class="empty">暂无进行中的在线登录</div>
               </div>
             </div>
           </section>
@@ -687,6 +769,15 @@
             sessions: [],
             about: {},
             importJson: "",
+            onlineLogin: {
+              providers: [
+                { id: "Google", label: "Google" },
+                { id: "Github", label: "Github" },
+              ],
+              busyProvider: "",
+              last: null,
+              pending: [],
+            },
             toast: { show: false, message: "" },
           };
         },
@@ -700,6 +791,10 @@
           statusLine() {
             const gateway = this.status.gateway || {};
             return gateway.host ? `${gateway.host}:${gateway.port}` : "server";
+          },
+          callbackPreview() {
+            const base = this.status.publicBaseUrl || window.location.origin;
+            return `${base.replace(/\/$/, "")}/admin/auth/callback/social`;
           },
         },
         methods: {
@@ -746,6 +841,7 @@
               this.loadKiroSettings(),
               this.loadSessions(),
               this.loadAbout(),
+              this.loadPending(),
             ]);
           },
           async loadStatus() {
@@ -797,6 +893,39 @@
             await this.loadAccounts();
             this.notify("账号已导入");
           },
+          async startOnlineLogin(provider) {
+            this.onlineLogin.busyProvider = provider;
+            try {
+              const result = await this.api("/admin/api/online-login/social/begin", {
+                method: "POST",
+                body: JSON.stringify({ provider }),
+              });
+              this.onlineLogin.last = result;
+              await this.loadPending();
+              const popup = window.open("about:blank", "kam-online-login", "width=1040,height=820");
+              if (!popup) {
+                window.location.href = result.authorizeUrl;
+              } else {
+                popup.opener = null;
+                popup.location.href = result.authorizeUrl;
+                this.notify(`${result.provider} 在线登录已打开`);
+              }
+            } catch (error) {
+              this.notify(error.message || "在线登录启动失败");
+            } finally {
+              this.onlineLogin.busyProvider = "";
+            }
+          },
+          async loadPending() {
+            this.onlineLogin.pending = await this.api("/admin/api/online-login/pending");
+          },
+          async handleOnlineLoginMessage(event) {
+            if (event.origin && event.origin !== window.location.origin) return;
+            if (event.data?.type !== "kam-online-login-complete") return;
+            this.notify(event.data.message || (event.data.ok ? "在线登录成功" : "在线登录失败"));
+            await Promise.allSettled([this.loadAccounts(), this.loadPending(), this.loadStatus()]);
+            this.view = "accounts";
+          },
           async loadLogs() {
             this.logs = await this.api("/admin/api/logs?limit=160");
           },
@@ -832,6 +961,11 @@
           },
         },
         mounted() {
+          window.addEventListener("message", this.handleOnlineLoginMessage);
+          if ("BroadcastChannel" in window) {
+            this.onlineLoginChannel = new BroadcastChannel("kam-online-login");
+            this.onlineLoginChannel.onmessage = this.handleOnlineLoginMessage;
+          }
           this.api("/admin/api/status")
             .then(() => {
               this.session = true;
@@ -840,6 +974,10 @@
             .catch(() => {
               this.session = false;
             });
+        },
+        beforeUnmount() {
+          window.removeEventListener("message", this.handleOnlineLoginMessage);
+          if (this.onlineLoginChannel) this.onlineLoginChannel.close();
         },
       }).mount("#app");
     </script>
