@@ -58,10 +58,12 @@ pub struct AdminState {
     admin_token: Arc<String>,
     public_base_url: Option<String>,
     started_at: Instant,
-    runtime_config: GatewayConfig,
+    runtime_config: gateway::SharedGatewayConfig,
     request_count: Arc<AtomicU64>,
     last_error: Arc<AsyncMutex<Option<String>>>,
     log_store: Arc<log_store::LogStore>,
+    load_balancer: Arc<gateway::load_balancer::LoadBalancer>,
+    response_cache: Arc<AsyncMutex<gateway::response_cache::ResponseCache>>,
     accounts: Arc<Mutex<AccountStore>>,
     group_tags: Arc<Mutex<GroupTagStore>>,
     online_logins: Arc<Mutex<HashMap<String, PendingOnlineLogin>>>,
@@ -257,10 +259,12 @@ pub fn router(state: AdminState) -> Router {
 
 impl AdminState {
     pub fn from_runtime(
-        runtime_config: GatewayConfig,
+        runtime_config: gateway::SharedGatewayConfig,
         request_count: Arc<AtomicU64>,
         last_error: Arc<AsyncMutex<Option<String>>>,
         log_store: Arc<log_store::LogStore>,
+        load_balancer: Arc<gateway::load_balancer::LoadBalancer>,
+        response_cache: Arc<AsyncMutex<gateway::response_cache::ResponseCache>>,
     ) -> Result<Self, String> {
         let admin_token = read_admin_token();
         if admin_token.is_empty() {
@@ -280,6 +284,8 @@ impl AdminState {
             request_count,
             last_error,
             log_store,
+            load_balancer,
+            response_cache,
             accounts: Arc::new(Mutex::new(AccountStore::new())),
             group_tags: Arc::new(Mutex::new(GroupTagStore::new())),
             online_logins: Arc::new(Mutex::new(HashMap::new())),
@@ -1555,14 +1561,36 @@ async fn server_add_account_by_idc(
 }
 
 async fn gateway_status(state: &AdminState) -> GatewayStatus {
+    let config = state.runtime_config.read().await.clone();
     let last_error = state.last_error.lock().await.clone();
     GatewayStatus {
         running: true,
-        host: state.runtime_config.host.clone(),
-        port: state.runtime_config.port,
+        host: config.host.clone(),
+        port: config.port,
         request_count: state.request_count.load(Ordering::Relaxed),
         last_error,
-        runtime_config: Some(state.runtime_config.clone()),
+        runtime_config: Some(config),
+    }
+}
+
+async fn apply_gateway_config(
+    state: &AdminState,
+    config: GatewayConfig,
+) -> Result<gateway::GatewayConfigApplyResult, String> {
+    gateway::apply_gateway_config_update(
+        &state.runtime_config,
+        &state.load_balancer,
+        &state.response_cache,
+        config,
+    )
+    .await
+}
+
+fn gateway_config_apply_message(restart_required: bool) -> &'static str {
+    if restart_required {
+        "Configuration saved. Host or port changed; restart the kam-server container to apply listener changes."
+    } else {
+        "Configuration saved and applied live."
     }
 }
 
@@ -1602,11 +1630,12 @@ async fn save_gateway_config(
         return response;
     }
 
-    match gateway::save_gateway_config(&config) {
-        Ok(()) => Json(json!({
+    match apply_gateway_config(&state, config).await {
+        Ok(result) => Json(json!({
             "ok": true,
-            "restartRequired": true,
-            "message": "Configuration saved. Restart the kam-server container to apply listener/runtime changes."
+            "config": result.config,
+            "restartRequired": result.restart_required,
+            "message": gateway_config_apply_message(result.restart_required)
         }))
         .into_response(),
         Err(error) => json_error(StatusCode::BAD_REQUEST, error),
@@ -1622,10 +1651,13 @@ async fn start_gateway(
         return response;
     }
 
-    let restart_required = payload.is_some();
+    let mut restart_required = false;
     if let Some(Json(config)) = payload {
-        if let Err(error) = gateway::save_gateway_config(&config) {
-            return json_error(StatusCode::BAD_REQUEST, error);
+        match apply_gateway_config(&state, config).await {
+            Ok(result) => {
+                restart_required = result.restart_required;
+            }
+            Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
         }
     }
 
@@ -1633,7 +1665,7 @@ async fn start_gateway(
         "ok": true,
         "gateway": gateway_status(&state).await,
         "restartRequired": restart_required,
-        "message": "kam-server keeps the Gateway listener online; restart the container after changing runtime config."
+        "message": gateway_config_apply_message(restart_required)
     }))
     .into_response()
 }
@@ -2683,10 +2715,31 @@ async fn invoke_command(
                 Ok(config) => config,
                 Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
             };
-            json_result(gateway::save_gateway_config(&config))
+            match apply_gateway_config(&state, config).await {
+                Ok(result) => Json(json!({
+                    "ok": true,
+                    "config": result.config,
+                    "restartRequired": result.restart_required,
+                    "message": gateway_config_apply_message(result.restart_required)
+                }))
+                .into_response(),
+                Err(error) => json_error(StatusCode::BAD_REQUEST, error),
+            }
         }
         "get_gateway_status" => Json(gateway_status(&state).await).into_response(),
-        "start_gateway" | "stop_gateway" => Json(gateway_status(&state).await).into_response(),
+        "start_gateway" => {
+            if let Some(config_value) = payload.get("config").cloned() {
+                let config = match serde_json::from_value::<GatewayConfig>(config_value) {
+                    Ok(config) => config,
+                    Err(error) => return json_error(StatusCode::BAD_REQUEST, error.to_string()),
+                };
+                if let Err(error) = apply_gateway_config(&state, config).await {
+                    return json_error(StatusCode::BAD_REQUEST, error);
+                }
+            }
+            Json(gateway_status(&state).await).into_response()
+        }
+        "stop_gateway" => Json(gateway_status(&state).await).into_response(),
         "get_gateway_log_dir" => Json(
             std::env::var("KAM_DATA_DIR")
                 .map(|dir| format!("{}/gateway/logs", dir.trim_end_matches(['/', '\\'])))
@@ -3146,14 +3199,15 @@ async fn save_prompt_cache(
         config.prompt_cache_ignore_client_control = ignore;
     }
 
-    match gateway::save_gateway_config(&config) {
-        Ok(()) => Json(json!({
+    match apply_gateway_config(&state, config).await {
+        Ok(result) => Json(json!({
             "ok": true,
-            "promptCacheTargetPercent": config.prompt_cache_target_percent,
-            "promptCacheTtlSecs": config.prompt_cache_ttl_secs,
-            "promptCacheMaxEntries": config.prompt_cache_max_entries,
-            "promptCacheIgnoreClientControl": config.prompt_cache_ignore_client_control,
-            "restartRequired": true
+            "promptCacheTargetPercent": result.config.prompt_cache_target_percent,
+            "promptCacheTtlSecs": result.config.prompt_cache_ttl_secs,
+            "promptCacheMaxEntries": result.config.prompt_cache_max_entries,
+            "promptCacheIgnoreClientControl": result.config.prompt_cache_ignore_client_control,
+            "restartRequired": result.restart_required,
+            "message": gateway_config_apply_message(result.restart_required)
         }))
         .into_response(),
         Err(error) => json_error(StatusCode::BAD_REQUEST, error),

@@ -177,7 +177,7 @@ impl AccountHealth {
 #[derive(Debug)]
 pub struct LoadBalancer {
     /// 负载均衡策略
-    strategy: LoadBalancerStrategy,
+    strategy: Arc<RwLock<LoadBalancerStrategy>>,
     /// 当前轮询索引（用于 RoundRobin）
     current_index: Arc<RwLock<usize>>,
     /// 账号健康状态
@@ -194,13 +194,22 @@ pub struct LoadBalancer {
 impl LoadBalancer {
     pub fn new(strategy: LoadBalancerStrategy) -> Self {
         Self {
-            strategy,
+            strategy: Arc::new(RwLock::new(strategy)),
             current_index: Arc::new(RwLock::new(0)),
             health_map: Arc::new(RwLock::new(HashMap::new())),
             health_check_interval: Duration::from_secs(30),
             rate_limited_accounts: Arc::new(RwLock::new(HashMap::new())),
             banned_accounts: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub async fn set_strategy(&self, strategy: LoadBalancerStrategy) {
+        *self.strategy.write().await = strategy;
+    }
+
+    #[cfg(test)]
+    pub async fn current_strategy(&self) -> LoadBalancerStrategy {
+        self.strategy.read().await.clone()
     }
 
     /// 选择账号
@@ -218,7 +227,8 @@ impl LoadBalancer {
             return accounts.first().cloned();
         }
 
-        match self.strategy {
+        let strategy = self.strategy.read().await.clone();
+        match strategy {
             LoadBalancerStrategy::RoundRobin => self.select_round_robin(&healthy_accounts).await,
             LoadBalancerStrategy::Random => self.select_random(&healthy_accounts),
             LoadBalancerStrategy::Balanced => self.select_balanced(&healthy_accounts),

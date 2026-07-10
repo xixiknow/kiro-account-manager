@@ -439,7 +439,8 @@ export const buildGatewayActionSummary = ({
   isDirty,
   hasUnsavedChanges,
   hasRuntimeChanges,
-  hasFieldErrors }: any) => {
+  hasFieldErrors,
+  liveReload = false }: any) => {
   const unsavedChanges = hasUnsavedChanges ?? isDirty ?? false
   const runtimeChanges = hasRuntimeChanges ?? (running && unsavedChanges)
 
@@ -447,23 +448,29 @@ export const buildGatewayActionSummary = ({
     return {
       tone: 'red',
       title: '先修正配置错误',
-      description: '当前表单存在无效配置，保存、启动和重启都会被拦截，先修正标红字段。'
+      description: liveReload
+        ? '当前表单存在无效配置，保存和应用都会被拦截，先修正标红字段。'
+        : '当前表单存在无效配置，保存、启动和重启都会被拦截，先修正标红字段。'
     }
   }
 
-  if (running && unsavedChanges && runtimeChanges) {
+  if (running && runtimeChanges) {
     return {
       tone: 'yellow',
-      title: '配置已变更，重启后生效',
-      description: '2API仍按已启动时的配置运行。先保存，再执行重启2API，才能让新配置生效。'
+      title: liveReload ? '入口变更待重启' : '配置已变更，重启后生效',
+      description: liveReload
+        ? '非监听配置已实时生效；host/port 需要重启容器后才会切换监听地址。'
+        : '2API仍按已启动时的配置运行。先保存，再执行重启2API，才能让新配置生效。'
     }
   }
 
   if (running && unsavedChanges) {
     return {
       tone: 'blue',
-      title: '当前运行配置尚未保存',
-      description: '当前页面配置已经用于运行2API，但还没有写回配置文件；如需保留下次启动沿用，请保存配置。'
+      title: liveReload ? '配置待保存' : '当前运行配置尚未保存',
+      description: liveReload
+        ? '保存后会立即应用到下一次请求；只有 host/port 需要重启容器。'
+        : '当前页面配置已经用于运行2API，但还没有写回配置文件；如需保留下次启动沿用，请保存配置。'
     }
   }
 

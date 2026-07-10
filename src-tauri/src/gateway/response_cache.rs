@@ -116,6 +116,19 @@ impl ResponseCache {
         }
     }
 
+    pub fn update_config(&mut self, config: CacheConfig) {
+        if self.config.lru_cache_capacity != config.lru_cache_capacity {
+            let lru_capacity = NonZeroUsize::new(config.lru_cache_capacity).unwrap();
+            self.lru_cache = LruCache::new(lru_capacity);
+        }
+        self.config = config;
+    }
+
+    #[cfg(test)]
+    pub fn config_snapshot(&self) -> CacheConfig {
+        self.config.clone()
+    }
+
     /// 生成缓存键
     fn cache_key(session_id: &str, messages_hash: &str) -> String {
         format!("{}:{}", session_id, messages_hash)

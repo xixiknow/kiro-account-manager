@@ -262,6 +262,7 @@ struct RequestLogContext<'a> {
     model_hint: Option<String>,
     /// 是否流式请求（避免 request 为 None 时丢失信息）
     is_stream: Option<bool>,
+    log_requests: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -826,6 +827,7 @@ async fn guarded_local_response(
         .request_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let started_at = Instant::now();
+    let config = state.config_snapshot().await;
     let log_context = RequestLogContext {
         request_index,
         endpoint,
@@ -839,9 +841,10 @@ async fn guarded_local_response(
         request_body_hint: None,
         model_hint: None,
         is_stream: None,
+        log_requests: config.log_requests,
     };
 
-    if state.config.local_only && !client_addr.ip().is_loopback() {
+    if config.local_only && !client_addr.ip().is_loopback() {
         let message = format!("已拒绝来自非本机地址的访问: {}", client_addr.ip());
         return gateway_error_with_log(
             &state,
@@ -856,9 +859,9 @@ async fn guarded_local_response(
         )
         .await;
     }
-    if !state.config.local_only
-        && !state.config.allowed_ips.is_empty()
-        && !ip_matches_allowlist(client_addr.ip(), &state.config.allowed_ips)
+    if !config.local_only
+        && !config.allowed_ips.is_empty()
+        && !ip_matches_allowlist(client_addr.ip(), &config.allowed_ips)
     {
         let message = format!("访问地址 {} 不在2API白名单中", client_addr.ip());
         return gateway_error_with_log(
@@ -874,7 +877,7 @@ async fn guarded_local_response(
         )
         .await;
     }
-    if let Err(message) = verify_client_auth(&headers, &state.config) {
+    if let Err(message) = verify_client_auth(&headers, &config) {
         let sanitized = sanitize_error(&message);
         return gateway_error_with_log(
             &state,
@@ -1238,7 +1241,7 @@ fn write_request_log(
     };
 
     // 如果关闭了日志记录，跳过
-    if !state.config.log_requests {
+    if !context.log_requests {
         return;
     }
 
@@ -1411,6 +1414,7 @@ pub async fn proxy_handler(
     }
 
     let model_hint = extract_model_from_payload(&raw_request_body);
+    let config = state.config_snapshot().await;
     let base_log_context = RequestLogContext {
         request_index,
         endpoint,
@@ -1424,9 +1428,10 @@ pub async fn proxy_handler(
         request_body_hint: None,
         model_hint,
         is_stream: None,
+        log_requests: config.log_requests,
     };
 
-    if state.config.local_only && !client_addr.ip().is_loopback() {
+    if config.local_only && !client_addr.ip().is_loopback() {
         let message = format!("已拒绝来自非本机地址的访问: {}", client_addr.ip());
         return gateway_error_with_log(
             &state,
@@ -1441,9 +1446,9 @@ pub async fn proxy_handler(
         )
         .await;
     }
-    if !state.config.local_only
-        && !state.config.allowed_ips.is_empty()
-        && !ip_matches_allowlist(client_addr.ip(), &state.config.allowed_ips)
+    if !config.local_only
+        && !config.allowed_ips.is_empty()
+        && !ip_matches_allowlist(client_addr.ip(), &config.allowed_ips)
     {
         let message = format!("访问地址 {} 不在2API白名单中", client_addr.ip());
         return gateway_error_with_log(
@@ -1460,7 +1465,7 @@ pub async fn proxy_handler(
         .await;
     }
 
-    if let Err(message) = verify_client_auth(&headers, &state.config) {
+    if let Err(message) = verify_client_auth(&headers, &config) {
         let sanitized = sanitize_error(&message);
         return gateway_error_with_log(
             &state,
@@ -1497,7 +1502,7 @@ pub async fn proxy_handler(
 
     // 模型映射：根据规则替换请求的模型名
     let original_model = request.model.clone();
-    request.model = super::resolve_model_mapping(&state.config, &request.model);
+    request.model = super::resolve_model_mapping(&config, &request.model);
     if request.model != original_model {
         log::info!("[模型映射] {} → {}", original_model, request.model);
     }
@@ -1544,15 +1549,15 @@ pub async fn proxy_handler(
 
     // Token 估算和裁剪（在创建 log context 之前）
     // 应用系统提示过滤
-    let has_filters = state.config.filter_claude_code
-        || state.config.filter_strip_boundaries
-        || state.config.filter_env_noise
-        || !state.config.prompt_filter_rules.is_empty();
+    let has_filters = config.filter_claude_code
+        || config.filter_strip_boundaries
+        || config.filter_env_noise
+        || !config.prompt_filter_rules.is_empty();
     if has_filters {
         for msg in &mut request.messages {
             if msg.role == "system" {
                 if let Some(serde_json::Value::String(text)) = &msg.content {
-                    let filtered = super::prompt_filter::apply_prompt_filters(&state.config, text);
+                    let filtered = super::prompt_filter::apply_prompt_filters(&config, text);
                     msg.content = Some(serde_json::Value::String(filtered));
                 }
             }
@@ -1636,7 +1641,7 @@ pub async fn proxy_handler(
         ..base_log_context.clone()
     };
 
-    let upstream = match resolve_upstream_credentials(&state.config, &state).await {
+    let upstream = match resolve_upstream_credentials(&config, &state).await {
         Ok(creds) => creds,
         Err(message) => {
             // 检查是否是配额不足错误（以 __402__ 为前缀标记）
@@ -1867,7 +1872,7 @@ pub async fn proxy_handler(
             tried_account_ids.insert(extract_account_id_from_upstream(&creds));
             creds
         } else if account_attempt > 1 {
-            match resolve_upstream_credentials(&state.config, &state).await {
+            match resolve_upstream_credentials(&config, &state).await {
                 Ok(creds) => {
                     // 检查是否已经尝试过这个账号
                     let account_id = extract_account_id_from_upstream(&creds);
@@ -1976,7 +1981,7 @@ pub async fn proxy_handler(
                         );
 
                         match force_refresh_upstream_credentials(
-                            &state.config,
+                            &config,
                             &state,
                             &current_upstream,
                         )
@@ -2074,6 +2079,7 @@ pub async fn proxy_handler(
                 .map(str::to_string),
             model_hint: upstream_payload_log_context.model_hint.clone(),
             is_stream: Some(true),
+            log_requests: upstream_payload_log_context.log_requests,
         };
 
         return stream_proxy_response(
@@ -2087,6 +2093,10 @@ pub async fn proxy_handler(
             request.previous_response_id.clone(),
             request.tool_name_map.clone(),
             static_log_context,
+            config.prompt_cache_target_percent,
+            config.prompt_cache_ttl_secs,
+            config.prompt_cache_ignore_client_control,
+            config.prompt_cache_max_entries,
         );
     }
 
@@ -2275,19 +2285,15 @@ pub async fn proxy_handler(
             tools_json.as_deref(),
             aggregated.input_tokens as usize,
             &request.model,
-            Some(Duration::from_secs(state.config.prompt_cache_ttl_secs)),
-            state.config.prompt_cache_ignore_client_control,
+            Some(Duration::from_secs(config.prompt_cache_ttl_secs)),
+            config.prompt_cache_ignore_client_control,
         ) {
             let cache_usage = tracker.compute_with_target_percent(
                 &request.model,
                 &profile,
-                state.config.prompt_cache_target_percent,
+                config.prompt_cache_target_percent,
             );
-            tracker.update(
-                &request.model,
-                &profile,
-                state.config.prompt_cache_max_entries,
-            );
+            tracker.update(&request.model, &profile, config.prompt_cache_max_entries);
 
             if cache_usage.cache_read_input_tokens > 0 {
                 aggregated.cache_read_input_tokens =
@@ -2302,7 +2308,7 @@ pub async fn proxy_handler(
                 "[非流式] Prompt Cache 模拟: read={}, creation={}, target={}%",
                 cache_usage.cache_read_input_tokens,
                 cache_usage.cache_creation_input_tokens,
-                state.config.prompt_cache_target_percent
+                config.prompt_cache_target_percent
             );
         }
     }
@@ -2750,7 +2756,7 @@ async fn resolve_managed_account_credentials(
             if !access_token.is_empty() {
                 let ctx = crate::commands::common::resolve_kiro_call_context(
                     &account,
-                    &state.config.region,
+                    &config.region,
                 );
                 let available_models_profile_arn = ctx.profile_arn.clone();
                 let http = match build_streaming_http_client_for_account(&account) {
@@ -2772,7 +2778,7 @@ async fn resolve_managed_account_credentials(
                     available_models_profile_arn,
                     provider: account.provider.clone(),
                     region: ctx.region,
-                    source_label: format_managed_upstream_source(&state.config, &account),
+                    source_label: format_managed_upstream_source(config, &account),
                     user_agent: build_kiro_custom_user_agent(&ctx.machine_id),
                     auth_method: account.auth_method.clone(),
                     send_opt_out: should_send_codewhisperer_optout(),
@@ -3602,6 +3608,10 @@ fn stream_proxy_response(
     previous_response_id: Option<String>,
     tool_name_map: std::collections::HashMap<String, String>,
     log_context: RequestLogContext<'static>,
+    prompt_cache_target_percent: u16,
+    prompt_cache_ttl_secs: u64,
+    prompt_cache_ignore_client_control: bool,
+    prompt_cache_max_entries: usize,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(2048);
     tokio::spawn(async move {
@@ -4503,20 +4513,16 @@ fn stream_proxy_response(
                 tools_json.as_deref(),
                 aggregated.input_tokens as usize,
                 &model,
-                Some(Duration::from_secs(state.config.prompt_cache_ttl_secs)),
-                state.config.prompt_cache_ignore_client_control,
+                Some(Duration::from_secs(prompt_cache_ttl_secs)),
+                prompt_cache_ignore_client_control,
             ) {
                 let account_id = model.as_str();
                 let cache_usage = tracker.compute_with_target_percent(
                     account_id,
                     &profile,
-                    state.config.prompt_cache_target_percent,
+                    prompt_cache_target_percent,
                 );
-                tracker.update(
-                    account_id,
-                    &profile,
-                    state.config.prompt_cache_max_entries,
-                );
+                tracker.update(account_id, &profile, prompt_cache_max_entries);
 
                 if cache_usage.cache_read_input_tokens > 0 {
                     aggregated.cache_read_input_tokens =
@@ -4531,7 +4537,7 @@ fn stream_proxy_response(
                     "[流式] Prompt Cache 模拟: read={}, creation={}, target={}%",
                     cache_usage.cache_read_input_tokens,
                     cache_usage.cache_creation_input_tokens,
-                    state.config.prompt_cache_target_percent
+                    prompt_cache_target_percent
                 );
             }
         }
@@ -5090,13 +5096,14 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     fn proxy_test_state() -> RouterState {
+        let config = GatewayConfig {
+            access_token: Some("sk-test".to_string()),
+            account_mode: "single".to_string(),
+            account_id: Some("test-account".to_string()),
+            ..GatewayConfig::default()
+        };
         RouterState {
-            config: GatewayConfig {
-                access_token: Some("sk-test".to_string()),
-                account_mode: "single".to_string(),
-                account_id: Some("test-account".to_string()),
-                ..GatewayConfig::default()
-            },
+            config: Arc::new(tokio::sync::RwLock::new(config)),
             request_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(AsyncMutex::new(None)),
             http: Client::new(),

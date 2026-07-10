@@ -38,7 +38,7 @@ use std::{
 use tauri::{AppHandle, Manager};
 use tokio::{
     net::TcpListener,
-    sync::{oneshot, Mutex as AsyncMutex},
+    sync::{oneshot, Mutex as AsyncMutex, RwLock},
     task::JoinHandle,
 };
 
@@ -129,6 +129,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub prompt_cache_ignore_client_control: bool,
 }
+
+pub(crate) type SharedGatewayConfig = Arc<RwLock<GatewayConfig>>;
 
 fn default_cache_ttl() -> u64 {
     180
@@ -345,7 +347,7 @@ pub struct GatewayRequestStats {
 
 #[derive(Debug)]
 pub struct GatewayRuntime {
-    pub config: GatewayConfig,
+    pub config: SharedGatewayConfig,
     pub request_count: Arc<AtomicU64>,
     pub last_error: Arc<AsyncMutex<Option<String>>>,
     pub log_store: Arc<log_store::LogStore>,
@@ -372,7 +374,7 @@ pub(crate) type ResponsesSessionStore = Arc<AsyncMutex<HashMap<String, Responses
 
 #[derive(Clone)]
 struct RouterState {
-    config: GatewayConfig,
+    config: SharedGatewayConfig,
     request_count: Arc<AtomicU64>,
     last_error: Arc<AsyncMutex<Option<String>>>,
     http: Client,
@@ -382,6 +384,12 @@ struct RouterState {
     load_balancer: Arc<load_balancer::LoadBalancer>,
     log_store: Arc<log_store::LogStore>,
     response_cache: Arc<AsyncMutex<response_cache::ResponseCache>>,
+}
+
+impl RouterState {
+    pub(crate) async fn config_snapshot(&self) -> GatewayConfig {
+        self.config.read().await.clone()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -757,6 +765,61 @@ pub fn save_gateway_config(config: &GatewayConfig) -> Result<(), String> {
     fs::write(path, content).map_err(|e| format!("写入配置失败: {e}"))
 }
 
+fn response_cache_config_from_gateway(config: &GatewayConfig) -> response_cache::CacheConfig {
+    response_cache::CacheConfig {
+        summary_cache_enabled: config.response_cache_enabled,
+        summary_cache_max_age_seconds: config.response_cache_ttl,
+        ..response_cache::CacheConfig::default()
+    }
+}
+
+fn listener_config_changed(current: &GatewayConfig, next: &GatewayConfig) -> bool {
+    current.host != next.host || current.port != next.port
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayConfigApplyResult {
+    pub config: GatewayConfig,
+    pub restart_required: bool,
+}
+
+pub async fn apply_gateway_config_update(
+    shared_config: &SharedGatewayConfig,
+    load_balancer: &Arc<load_balancer::LoadBalancer>,
+    response_cache: &Arc<AsyncMutex<response_cache::ResponseCache>>,
+    config: GatewayConfig,
+) -> Result<GatewayConfigApplyResult, String> {
+    let normalized = normalize_config(&config);
+    ensure_config_valid(&normalized)?;
+
+    let current = shared_config.read().await.clone();
+    let restart_required = listener_config_changed(&current, &normalized);
+
+    save_gateway_config(&normalized)?;
+
+    let mut runtime_config = normalized.clone();
+    if restart_required {
+        runtime_config.host = current.host.clone();
+        runtime_config.port = current.port;
+    }
+
+    {
+        let mut guard = shared_config.write().await;
+        *guard = runtime_config;
+    }
+
+    let strategy = load_balancer::LoadBalancerStrategy::from_str(&normalized.strategy);
+    load_balancer.set_strategy(strategy).await;
+
+    let cache_config = response_cache_config_from_gateway(&normalized);
+    response_cache.lock().await.update_config(cache_config);
+
+    Ok(GatewayConfigApplyResult {
+        config: normalized,
+        restart_required,
+    })
+}
+
 pub fn append_gateway_request_log(entry: &GatewayRequestLogEntry) -> Result<(), String> {
     let path = request_log_path()?;
     append_gateway_request_log_to_path(&path, entry)
@@ -1065,7 +1128,8 @@ pub async fn get_gateway_status(
         })
     };
 
-    if let Some((config, request_count, last_error, running)) = snapshot {
+    if let Some((config_handle, request_count, last_error, running)) = snapshot {
+        let config = config_handle.read().await.clone();
         let last_error_text = last_error.lock().await.clone();
         Ok(GatewayStatus {
             running,
@@ -1098,6 +1162,7 @@ fn router(state: RouterState) -> Router {
 
 async fn spawn_runtime(config: GatewayConfig) -> Result<GatewayRuntime, String> {
     ensure_config_valid(&config)?;
+    let config_handle = Arc::new(RwLock::new(config.clone()));
 
     let request_count = Arc::new(AtomicU64::new(0));
     let last_error = Arc::new(AsyncMutex::new(None));
@@ -1127,11 +1192,7 @@ async fn spawn_runtime(config: GatewayConfig) -> Result<GatewayRuntime, String> 
     }
 
     // 初始化响应缓存
-    let cache_config = response_cache::CacheConfig {
-        summary_cache_enabled: config.response_cache_enabled,
-        summary_cache_max_age_seconds: config.response_cache_ttl,
-        ..response_cache::CacheConfig::default()
-    };
+    let cache_config = response_cache_config_from_gateway(&config);
     let cache_dir = Some(gateway_data_dir().join("cache"));
     let response_cache = Arc::new(AsyncMutex::new(response_cache::ResponseCache::new(
         cache_config,
@@ -1139,7 +1200,7 @@ async fn spawn_runtime(config: GatewayConfig) -> Result<GatewayRuntime, String> 
     )));
 
     let state = RouterState {
-        config: config.clone(),
+        config: config_handle.clone(),
         request_count: request_count.clone(),
         last_error: last_error.clone(),
         http,
@@ -1154,10 +1215,12 @@ async fn spawn_runtime(config: GatewayConfig) -> Result<GatewayRuntime, String> 
     #[cfg(feature = "server")]
     let app = {
         let admin_state = crate::server_admin::AdminState::from_runtime(
-            config.clone(),
+            config_handle.clone(),
             request_count.clone(),
             last_error.clone(),
             log_store.clone(),
+            load_balancer.clone(),
+            response_cache.clone(),
         )?;
         app.merge(crate::server_admin::router(admin_state))
     };
@@ -1184,7 +1247,7 @@ async fn spawn_runtime(config: GatewayConfig) -> Result<GatewayRuntime, String> 
     });
 
     Ok(GatewayRuntime {
-        config,
+        config: config_handle,
         request_count,
         last_error,
         log_store,
@@ -1306,6 +1369,8 @@ mod tests {
 
     static REQUEST_LOG_TEST_MUTEX: Mutex<()> = Mutex::new(());
     static REQUEST_LOG_TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static GATEWAY_CONFIG_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    static GATEWAY_CONFIG_TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct RequestLogTestFixture {
         path: PathBuf,
@@ -1341,6 +1406,44 @@ mod tests {
         }
     }
 
+    struct GatewayConfigTestFixture {
+        dir: PathBuf,
+        previous_data_dir: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl GatewayConfigTestFixture {
+        fn new() -> Self {
+            let guard = GATEWAY_CONFIG_TEST_MUTEX
+                .lock()
+                .expect("gateway config test mutex should lock");
+            let dir = std::env::temp_dir().join(format!(
+                "kiro-gateway-config-test-{}-{}",
+                process::id(),
+                GATEWAY_CONFIG_TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).expect("gateway config test dir should create");
+            let previous_data_dir = std::env::var_os("KAM_DATA_DIR");
+            std::env::set_var("KAM_DATA_DIR", &dir);
+            Self {
+                dir,
+                previous_data_dir,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for GatewayConfigTestFixture {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous_data_dir {
+                std::env::set_var("KAM_DATA_DIR", previous);
+            } else {
+                std::env::remove_var("KAM_DATA_DIR");
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
     fn gateway_runtime_test_state() -> RouterState {
         let config = GatewayConfig {
             access_token: Some("sk-test".to_string()),
@@ -1350,7 +1453,7 @@ mod tests {
         };
         let strategy = load_balancer::LoadBalancerStrategy::from_str(&config.strategy);
         RouterState {
-            config,
+            config: Arc::new(RwLock::new(config)),
             request_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(AsyncMutex::new(None)),
             http: Client::new(),
@@ -1375,7 +1478,7 @@ mod tests {
         let config = GatewayConfig::default();
         let strategy = load_balancer::LoadBalancerStrategy::from_str(&config.strategy);
         RouterState {
-            config,
+            config: Arc::new(RwLock::new(config)),
             request_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(AsyncMutex::new(None)),
             http: Client::new(),
@@ -1400,6 +1503,102 @@ mod tests {
             access_token: Some("sk-test".to_string()),
             ..GatewayConfig::default()
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_config_update_hot_applies_non_listener_fields() {
+        let _fixture = GatewayConfigTestFixture::new();
+        let initial = GatewayConfig {
+            access_token: Some("sk-old".to_string()),
+            client_api_keys: vec!["sk-old".to_string()],
+            account_mode: "single".to_string(),
+            account_id: Some("account-a".to_string()),
+            response_cache_enabled: true,
+            response_cache_ttl: 180,
+            ..GatewayConfig::default()
+        };
+        let shared_config = Arc::new(RwLock::new(initial.clone()));
+        let load_balancer = Arc::new(load_balancer::LoadBalancer::new(
+            load_balancer::LoadBalancerStrategy::RoundRobin,
+        ));
+        let response_cache = Arc::new(AsyncMutex::new(response_cache::ResponseCache::new(
+            response_cache_config_from_gateway(&initial),
+            None,
+        )));
+
+        let next = GatewayConfig {
+            access_token: Some("sk-new".to_string()),
+            client_api_keys: vec!["sk-new".to_string()],
+            strategy: "random".to_string(),
+            response_cache_enabled: false,
+            response_cache_ttl: 42,
+            prompt_cache_target_percent: 91,
+            ..initial.clone()
+        };
+
+        let result =
+            apply_gateway_config_update(&shared_config, &load_balancer, &response_cache, next)
+                .await
+                .expect("config update should apply");
+
+        assert!(!result.restart_required);
+        let applied = shared_config.read().await.clone();
+        assert_eq!(applied.client_api_keys, vec!["sk-new"]);
+        assert_eq!(applied.strategy, "random");
+        assert_eq!(applied.response_cache_ttl, 42);
+        assert_eq!(applied.prompt_cache_target_percent, 91);
+        assert_eq!(
+            load_balancer.current_strategy().await,
+            load_balancer::LoadBalancerStrategy::Random
+        );
+        let cache_config = response_cache.lock().await.config_snapshot();
+        assert!(!cache_config.summary_cache_enabled);
+        assert_eq!(cache_config.summary_cache_max_age_seconds, 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_config_update_keeps_listener_fields_until_restart() {
+        let _fixture = GatewayConfigTestFixture::new();
+        let initial = GatewayConfig {
+            host: "127.0.0.1".to_string(),
+            port: 8765,
+            access_token: Some("sk-test".to_string()),
+            client_api_keys: vec!["sk-test".to_string()],
+            account_mode: "single".to_string(),
+            account_id: Some("account-a".to_string()),
+            ..GatewayConfig::default()
+        };
+        let shared_config = Arc::new(RwLock::new(initial.clone()));
+        let load_balancer = Arc::new(load_balancer::LoadBalancer::new(
+            load_balancer::LoadBalancerStrategy::RoundRobin,
+        ));
+        let response_cache = Arc::new(AsyncMutex::new(response_cache::ResponseCache::new(
+            response_cache_config_from_gateway(&initial),
+            None,
+        )));
+
+        let next = GatewayConfig {
+            host: "0.0.0.0".to_string(),
+            port: 9876,
+            threshold: 77,
+            ..initial.clone()
+        };
+
+        let result =
+            apply_gateway_config_update(&shared_config, &load_balancer, &response_cache, next)
+                .await
+                .expect("config update should save pending listener config");
+
+        assert!(result.restart_required);
+        let applied = shared_config.read().await.clone();
+        assert_eq!(applied.host, "127.0.0.1");
+        assert_eq!(applied.port, 8765);
+        assert_eq!(applied.threshold, 77);
+
+        let saved = load_gateway_config().expect("saved config should load");
+        assert_eq!(saved.host, "0.0.0.0");
+        assert_eq!(saved.port, 9876);
+        assert_eq!(saved.threshold, 77);
     }
 
     #[tokio::test]

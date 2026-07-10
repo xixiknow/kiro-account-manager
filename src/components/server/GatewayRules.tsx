@@ -27,6 +27,7 @@ export default function GatewayRules() {
   const [groups, setGroups] = useState<any[]>([])
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [saveMessage, setSaveMessage] = useState('')
   const [error, setError] = useState('')
   const [showMappings, setShowMappings] = useState(false)
   const [showFilters, setShowFilters] = useState(false)
@@ -57,14 +58,21 @@ export default function GatewayRules() {
   const save = async () => {
     setSaving(true)
     setSaved(false)
+    setSaveMessage('')
     setError('')
     try {
-      await adminFetch('/admin/api/gateway/config', {
+      const result = await adminFetch<any>('/admin/api/gateway/config', {
         method: 'PUT',
         body: JSON.stringify(buildGatewayPayload(config)),
       })
       setSaved(true)
-      window.setTimeout(() => setSaved(false), 1600)
+      setSaveMessage(result?.restartRequired
+        ? '已保存；host/port 需要重启容器后切换监听地址'
+        : '已保存并实时生效')
+      window.setTimeout(() => {
+        setSaved(false)
+        setSaveMessage('')
+      }, 1800)
     } catch (err) {
       setError(String((err as any)?.message || err))
     } finally {
@@ -103,6 +111,11 @@ export default function GatewayRules() {
         {error && (
           <div className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-300">
             {error}
+          </div>
+        )}
+        {saveMessage && (
+          <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
+            {saveMessage}
           </div>
         )}
 

@@ -58,6 +58,7 @@ import {
   buildGatewayStatusState,
   DEFAULT_GATEWAY_CONFIG,
   DEFAULT_GATEWAY_STATUS,
+  fetchGatewayStatus,
   loadGatewayPageData,
   openGatewayLogDir,
   saveGatewayConfig,
@@ -66,6 +67,8 @@ import {
   hydrateGatewayConfig
 } from './gatewayPageState'
 import { useGatewayPolling } from './useGatewayPolling'
+
+declare const __KAM_SERVER_WEB__: boolean | undefined
 
 function Alert(props: any) {
   return <AlertPrimitive {...props} />
@@ -84,6 +87,7 @@ function ThemedAlert({ title, children, ...props }: any) {
 
 function GatewayPage() {
   const { t } = useApp()
+  const isServerWeb = typeof __KAM_SERVER_WEB__ !== 'undefined' && __KAM_SERVER_WEB__
 
   const [config, setConfig] = useState<GatewayConfig>(DEFAULT_GATEWAY_CONFIG)
   const [status, setStatus] = useState<GatewayStatus>(DEFAULT_GATEWAY_STATUS)
@@ -129,7 +133,7 @@ function GatewayPage() {
   const hasUnsavedChanges = configSnapshot !== savedConfigSnapshot
   const hasRuntimeChanges = !!status.running && !!appliedRuntimeSnapshot && runtimeSnapshot !== appliedRuntimeSnapshot
 
-  // 自动保存 + 自动重启（防抖 1.5 秒）
+  // 自动保存 + 热应用（防抖 1.5 秒）
   const autoSaveTimer = useRef<NodeJS.Timeout | null>(null)
   const isInitialLoad = useRef(true)
   useEffect(() => {
@@ -144,7 +148,9 @@ function GatewayPage() {
       try {
         await saveGatewayConfig(config)
         setSavedConfigSnapshot(buildGatewayConfigSnapshot(config))
-        if (status.running) {
+        if (isServerWeb) {
+          await refreshGatewayStatus(config)
+        } else if (status.running) {
           await stopGateway()
           const st = await startGateway(config)
           const nextStatus = buildGatewayStatusState(st, st, config)
@@ -168,8 +174,8 @@ function GatewayPage() {
     [effectiveConfig.host, effectiveConfig.port, effectiveConfig.localOnly]
   )
   const actionSummary = useMemo(
-    () => buildGatewayActionSummary({ running: status.running, isDirty: hasUnsavedChanges, hasUnsavedChanges, hasRuntimeChanges, hasFieldErrors }),
-    [status.running, hasUnsavedChanges, hasRuntimeChanges, hasFieldErrors]
+    () => buildGatewayActionSummary({ running: status.running, isDirty: hasUnsavedChanges, hasUnsavedChanges, hasRuntimeChanges, hasFieldErrors, liveReload: isServerWeb }),
+    [status.running, hasUnsavedChanges, hasRuntimeChanges, hasFieldErrors, isServerWeb]
   )
   const effectiveSecuritySummary = useMemo(
     () => buildGatewaySecuritySummary({ config: effectiveConfig }),
@@ -234,6 +240,17 @@ function GatewayPage() {
     if (!normalized) return
     setErrorHistory(prev => mergeErrorHistory(prev, normalized, formatGatewayTimestamp(), 8))
   }
+
+  const refreshGatewayStatus = useCallback(async (fallbackConfig: GatewayConfig) => {
+    const st = await fetchGatewayStatus()
+    const nextStatus = buildGatewayStatusState(st, st, fallbackConfig)
+    setStatus(nextStatus)
+    setAppliedRuntimeSnapshot(nextStatus.running && nextStatus.runtimeConfig
+      ? buildGatewayRuntimeSnapshot(nextStatus.runtimeConfig)
+      : null)
+    setLastStatusSyncAt(formatGatewayTimestamp())
+    return nextStatus
+  }, [])
 
   const loadAll = useCallback(async () => {
     setLoading(true)
@@ -336,6 +353,9 @@ function GatewayPage() {
     try {
       await saveGatewayConfig(config)
       setSavedConfigSnapshot(buildGatewayConfigSnapshot(config))
+      if (isServerWeb) {
+        await refreshGatewayStatus(config)
+      }
     } catch (e) {
       pushError(e)
     }
@@ -347,8 +367,9 @@ function GatewayPage() {
     try {
       await saveGatewayConfig(config)
       setSavedConfigSnapshot(buildGatewayConfigSnapshot(config))
-      // 保存成功后，如果网关正在运行则自动重启使配置生效
-      if (status.running) {
+      if (isServerWeb) {
+        await refreshGatewayStatus(config)
+      } else if (status.running) {
         await stopGateway()
         const st = await startGateway(config)
         const nextStatus = buildGatewayStatusState(st, st, config)

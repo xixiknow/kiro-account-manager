@@ -289,7 +289,7 @@ export const fetchGatewayRequestLogs = async (limit = 120) => {
   return Array.isArray(logs) ? logs : []
 }
 
-export const saveGatewayConfig = async (config: GatewayConfig) => invoke('save_gateway_config', {
+export const saveGatewayConfig = async (config: GatewayConfig) => invoke<any>('save_gateway_config', {
   config: buildGatewayPayload(config)})
 
 export const startGateway = async (config: GatewayConfig) => invoke<any>('start_gateway', {
