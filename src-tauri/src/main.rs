@@ -395,6 +395,9 @@ struct ServerModeOptions {
     allowed_ips: Vec<String>,
     local_only: Option<bool>,
     prompt_cache_target_percent: Option<u16>,
+    prompt_cache_ttl_secs: Option<u64>,
+    prompt_cache_max_entries: Option<usize>,
+    prompt_cache_ignore_client_control: Option<bool>,
     show_help: bool,
 }
 
@@ -474,6 +477,34 @@ fn parse_server_percent(value: &str, flag: &str) -> Result<u16, String> {
     Ok(percent)
 }
 
+fn parse_server_ttl_secs(value: &str, flag: &str) -> Result<u64, String> {
+    let secs = value
+        .parse::<u64>()
+        .map_err(|_| format!("{flag} 必须是正整数（秒）: {value}"))?;
+    if !(30..=3600).contains(&secs) {
+        return Err(format!("{flag} 必须在 30-3600 之间: {value}"));
+    }
+    Ok(secs)
+}
+
+fn parse_server_max_entries(value: &str, flag: &str) -> Result<usize, String> {
+    let n = value
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} 必须是正整数: {value}"))?;
+    if n < 1 {
+        return Err(format!("{flag} 必须 >= 1: {value}"));
+    }
+    Ok(n)
+}
+
+fn parse_server_bool(value: &str, flag: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("{flag} 必须是 true/false: {value}")),
+    }
+}
+
 fn parse_server_mode_options(args: &[String]) -> Result<Option<ServerModeOptions>, String> {
     if !server_mode_requested(args) {
         return Ok(None);
@@ -504,6 +535,17 @@ fn parse_server_mode_options(args: &[String]) -> Result<Option<ServerModeOptions
             | "--prompt-cache-hit" => {
                 let value = read_server_arg_value(args, &mut index, arg)?;
                 options.prompt_cache_target_percent = Some(parse_server_percent(&value, arg)?);
+            }
+            "--prompt-cache-ttl" | "--prompt-cache-ttl-secs" => {
+                let value = read_server_arg_value(args, &mut index, arg)?;
+                options.prompt_cache_ttl_secs = Some(parse_server_ttl_secs(&value, arg)?);
+            }
+            "--prompt-cache-max-entries" => {
+                let value = read_server_arg_value(args, &mut index, arg)?;
+                options.prompt_cache_max_entries = Some(parse_server_max_entries(&value, arg)?);
+            }
+            "--prompt-cache-ignore-client-control" => {
+                options.prompt_cache_ignore_client_control = Some(true);
             }
             "--remote" => options.local_only = Some(false),
             "--local-only" => options.local_only = Some(true),
@@ -547,6 +589,30 @@ fn parse_server_mode_options(args: &[String]) -> Result<Option<ServerModeOptions
                     "--prompt-cache-hit",
                 )?);
             }
+            value if value.starts_with("--prompt-cache-ttl-secs=") => {
+                options.prompt_cache_ttl_secs = Some(parse_server_ttl_secs(
+                    &value["--prompt-cache-ttl-secs=".len()..],
+                    "--prompt-cache-ttl-secs",
+                )?);
+            }
+            value if value.starts_with("--prompt-cache-ttl=") => {
+                options.prompt_cache_ttl_secs = Some(parse_server_ttl_secs(
+                    &value["--prompt-cache-ttl=".len()..],
+                    "--prompt-cache-ttl",
+                )?);
+            }
+            value if value.starts_with("--prompt-cache-max-entries=") => {
+                options.prompt_cache_max_entries = Some(parse_server_max_entries(
+                    &value["--prompt-cache-max-entries=".len()..],
+                    "--prompt-cache-max-entries",
+                )?);
+            }
+            value if value.starts_with("--prompt-cache-ignore-client-control=") => {
+                options.prompt_cache_ignore_client_control = Some(parse_server_bool(
+                    &value["--prompt-cache-ignore-client-control=".len()..],
+                    "--prompt-cache-ignore-client-control",
+                )?);
+            }
             value if value.starts_with("kiro-account-manager://") => {}
             value => return Err(format!("未知 server 参数: {value}")),
         }
@@ -568,6 +634,12 @@ fn print_server_mode_help() {
            --allow-ip <ip|cidr>       添加远程访问白名单，可重复\n\
            --prompt-cache-hit-percent <0-100>\n\
                                       覆盖 Prompt Cache 模拟命中率\n\
+           --prompt-cache-ttl <30-3600>\n\
+                                      覆盖 Prompt Cache 模拟 TTL（秒）\n\
+           --prompt-cache-max-entries <n>\n\
+                                      覆盖每模型最大缓存条目数\n\
+           --prompt-cache-ignore-client-control\n\
+                                      忽略客户端 cache_control，长请求一律走缓存\n\
            --local-only               只允许本机访问\n"
     );
 }
@@ -615,6 +687,15 @@ fn apply_server_mode_options(config: &mut gateway::GatewayConfig, options: &Serv
     }
     if let Some(percent) = options.prompt_cache_target_percent {
         config.prompt_cache_target_percent = percent;
+    }
+    if let Some(ttl) = options.prompt_cache_ttl_secs {
+        config.prompt_cache_ttl_secs = ttl;
+    }
+    if let Some(max_entries) = options.prompt_cache_max_entries {
+        config.prompt_cache_max_entries = max_entries;
+    }
+    if let Some(ignore) = options.prompt_cache_ignore_client_control {
+        config.prompt_cache_ignore_client_control = ignore;
     }
     for ip in options
         .allowed_ips

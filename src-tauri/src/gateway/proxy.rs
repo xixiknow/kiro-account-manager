@@ -2275,13 +2275,19 @@ pub async fn proxy_handler(
             tools_json.as_deref(),
             aggregated.input_tokens as usize,
             &request.model,
+            Some(Duration::from_secs(state.config.prompt_cache_ttl_secs)),
+            state.config.prompt_cache_ignore_client_control,
         ) {
             let cache_usage = tracker.compute_with_target_percent(
                 &request.model,
                 &profile,
                 state.config.prompt_cache_target_percent,
             );
-            tracker.update(&request.model, &profile);
+            tracker.update(
+                &request.model,
+                &profile,
+                state.config.prompt_cache_max_entries,
+            );
 
             if cache_usage.cache_read_input_tokens > 0 {
                 aggregated.cache_read_input_tokens =
@@ -4497,6 +4503,8 @@ fn stream_proxy_response(
                 tools_json.as_deref(),
                 aggregated.input_tokens as usize,
                 &model,
+                Some(Duration::from_secs(state.config.prompt_cache_ttl_secs)),
+                state.config.prompt_cache_ignore_client_control,
             ) {
                 let account_id = model.as_str();
                 let cache_usage = tracker.compute_with_target_percent(
@@ -4504,7 +4512,11 @@ fn stream_proxy_response(
                     &profile,
                     state.config.prompt_cache_target_percent,
                 );
-                tracker.update(account_id, &profile);
+                tracker.update(
+                    account_id,
+                    &profile,
+                    state.config.prompt_cache_max_entries,
+                );
 
                 if cache_usage.cache_read_input_tokens > 0 {
                     aggregated.cache_read_input_tokens =

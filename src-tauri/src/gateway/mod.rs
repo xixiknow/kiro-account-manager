@@ -119,6 +119,15 @@ pub struct GatewayConfig {
     /// Prompt Cache 模拟：稳态缓存命中目标百分比
     #[serde(default = "default_prompt_cache_target_percent")]
     pub prompt_cache_target_percent: u16,
+    /// Prompt Cache 模拟：缓存 TTL（秒），命中时滑动续期
+    #[serde(default = "default_prompt_cache_ttl_secs")]
+    pub prompt_cache_ttl_secs: u64,
+    /// Prompt Cache 模拟：每模型最大缓存条目数
+    #[serde(default = "default_prompt_cache_max_entries")]
+    pub prompt_cache_max_entries: usize,
+    /// Prompt Cache 模拟：忽略客户端 cache_control，长请求一律走缓存
+    #[serde(default)]
+    pub prompt_cache_ignore_client_control: bool,
 }
 
 fn default_cache_ttl() -> u64 {
@@ -127,6 +136,14 @@ fn default_cache_ttl() -> u64 {
 
 fn default_prompt_cache_target_percent() -> u16 {
     prompt_cache::DEFAULT_STABLE_CACHE_TARGET_PERCENT
+}
+
+fn default_prompt_cache_ttl_secs() -> u64 {
+    300
+}
+
+fn default_prompt_cache_max_entries() -> usize {
+    2000
 }
 
 /// 自定义提示过滤规则
@@ -459,6 +476,9 @@ impl Default for GatewayConfig {
             response_cache_enabled: true,
             response_cache_ttl: default_cache_ttl(),
             prompt_cache_target_percent: default_prompt_cache_target_percent(),
+            prompt_cache_ttl_secs: default_prompt_cache_ttl_secs(),
+            prompt_cache_max_entries: default_prompt_cache_max_entries(),
+            prompt_cache_ignore_client_control: false,
         }
     }
 }
@@ -572,6 +592,9 @@ fn ensure_config_valid(config: &GatewayConfig) -> Result<(), String> {
     }
     if config.prompt_cache_target_percent > 100 {
         return Err("promptCacheTargetPercent 必须在 0-100 之间".to_string());
+    }
+    if config.prompt_cache_max_entries < 1 {
+        return Err("promptCacheMaxEntries 必须 >= 1".to_string());
     }
     Ok(())
 }

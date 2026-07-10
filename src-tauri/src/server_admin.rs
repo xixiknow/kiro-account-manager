@@ -95,6 +95,12 @@ struct ImportResponse {
 #[serde(rename_all = "camelCase")]
 struct PromptCachePayload {
     prompt_cache_target_percent: u16,
+    #[serde(default)]
+    prompt_cache_ttl_secs: Option<u64>,
+    #[serde(default)]
+    prompt_cache_max_entries: Option<usize>,
+    #[serde(default)]
+    prompt_cache_ignore_client_control: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -3084,7 +3090,10 @@ async fn get_prompt_cache(headers: HeaderMap, State(state): State<AdminState>) -
 
     match gateway::get_gateway_config() {
         Ok(config) => Json(json!({
-            "promptCacheTargetPercent": config.prompt_cache_target_percent
+            "promptCacheTargetPercent": config.prompt_cache_target_percent,
+            "promptCacheTtlSecs": config.prompt_cache_ttl_secs,
+            "promptCacheMaxEntries": config.prompt_cache_max_entries,
+            "promptCacheIgnoreClientControl": config.prompt_cache_ignore_client_control
         }))
         .into_response(),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
@@ -3105,17 +3114,45 @@ async fn save_prompt_cache(
             "promptCacheTargetPercent must be from 0 to 100",
         );
     }
+    if let Some(ttl) = payload.prompt_cache_ttl_secs {
+        if !(30..=3600).contains(&ttl) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "promptCacheTtlSecs must be from 30 to 3600",
+            );
+        }
+    }
+    if let Some(max_entries) = payload.prompt_cache_max_entries {
+        if max_entries < 1 {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "promptCacheMaxEntries must be >= 1",
+            );
+        }
+    }
 
     let mut config = match gateway::get_gateway_config() {
         Ok(config) => config,
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     config.prompt_cache_target_percent = payload.prompt_cache_target_percent;
+    if let Some(ttl) = payload.prompt_cache_ttl_secs {
+        config.prompt_cache_ttl_secs = ttl;
+    }
+    if let Some(max_entries) = payload.prompt_cache_max_entries {
+        config.prompt_cache_max_entries = max_entries;
+    }
+    if let Some(ignore) = payload.prompt_cache_ignore_client_control {
+        config.prompt_cache_ignore_client_control = ignore;
+    }
 
     match gateway::save_gateway_config(&config) {
         Ok(()) => Json(json!({
             "ok": true,
             "promptCacheTargetPercent": config.prompt_cache_target_percent,
+            "promptCacheTtlSecs": config.prompt_cache_ttl_secs,
+            "promptCacheMaxEntries": config.prompt_cache_max_entries,
+            "promptCacheIgnoreClientControl": config.prompt_cache_ignore_client_control,
             "restartRequired": true
         }))
         .into_response(),

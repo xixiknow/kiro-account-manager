@@ -13,7 +13,6 @@ const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(60 * 60); // 1 小时
 const DEFAULT_MIN_CACHEABLE_TOKENS: usize = 1024;
 const OPUS_MIN_CACHEABLE_TOKENS: usize = 4096;
 pub const DEFAULT_STABLE_CACHE_TARGET_PERCENT: u16 = 90; // 理想稳态：约 90% 输入来自缓存，余下保留给最新上下文
-const MAX_ENTRIES_PER_ACCOUNT: usize = 200;
 
 /// 缓存使用统计
 #[derive(Debug, Clone, Default)]
@@ -73,8 +72,11 @@ impl PromptCacheTracker {
         tools: Option<&[serde_json::Value]>,
         total_input_tokens: usize,
         model: &str,
+        ttl_override: Option<Duration>,
+        ignore_client_control: bool,
     ) -> Option<CacheProfile> {
-        let blocks = self.flatten_cache_blocks(system, messages, tools);
+        let blocks =
+            self.flatten_cache_blocks(system, messages, tools, ttl_override, ignore_client_control);
         if blocks.is_empty() {
             return None;
         }
@@ -198,10 +200,11 @@ impl PromptCacheTracker {
     }
 
     /// 更新缓存条目（请求成功后调用）
-    pub fn update(&self, account_id: &str, profile: &CacheProfile) {
+    pub fn update(&self, account_id: &str, profile: &CacheProfile, max_entries: usize) {
         if profile.breakpoints.is_empty() || account_id.is_empty() {
             return;
         }
+        let max_entries = max_entries.max(1);
 
         let min_tokens = self.min_cacheable_tokens(&profile.model);
         let now = Instant::now();
@@ -226,10 +229,10 @@ impl PromptCacheTracker {
         }
 
         // 限制条目数
-        if entries.len() > MAX_ENTRIES_PER_ACCOUNT {
+        if entries.len() > max_entries {
             let mut sorted: Vec<_> = entries.iter().map(|(k, v)| (*k, v.expires_at)).collect();
             sorted.sort_by_key(|(_, exp)| *exp);
-            let to_remove = entries.len() - MAX_ENTRIES_PER_ACCOUNT;
+            let to_remove = entries.len() - max_entries;
             for (key, _) in sorted.iter().take(to_remove) {
                 entries.remove(key);
             }
@@ -243,24 +246,38 @@ impl PromptCacheTracker {
         system: Option<&serde_json::Value>,
         messages: &[serde_json::Value],
         tools: Option<&[serde_json::Value]>,
+        ttl_override: Option<Duration>,
+        ignore_client_control: bool,
     ) -> Vec<CacheableBlock> {
         let mut blocks = Vec::new();
-        let default_ttl = Duration::from_secs(5 * 60); // 5 分钟默认 TTL
+        // system/tools 自动缓存块使用的默认 TTL（可被配置覆盖）
+        let default_ttl = ttl_override.unwrap_or(DEFAULT_CACHE_TTL);
+
+        // 解析块的有效 TTL：
+        // - ignore_client_control：忽略客户端 cache_control，统一用 default_ttl
+        // - 否则：尊重客户端 extract_ttl，未标记时回退 fallback（system/tools 用 default_ttl，
+        //   消息块用 Duration::ZERO 表示不缓存）
+        let resolve_ttl = |value: &serde_json::Value, fallback: Duration| -> Duration {
+            if ignore_client_control {
+                return default_ttl;
+            }
+            let client_ttl = self.extract_ttl(value);
+            if client_ttl > Duration::ZERO {
+                client_ttl
+            } else {
+                fallback
+            }
+        };
 
         // 工具定义（自动可缓存）
         if let Some(tools) = tools {
             for tool in tools {
                 let value = self.canonicalize(tool);
                 let tokens = estimate_tokens(&value);
-                let ttl = self.extract_ttl(tool);
                 blocks.push(CacheableBlock {
                     value,
                     tokens,
-                    ttl: if ttl > Duration::ZERO {
-                        ttl
-                    } else {
-                        default_ttl
-                    },
+                    ttl: resolve_ttl(tool, default_ttl),
                     is_message_end: false,
                 });
             }
@@ -282,15 +299,10 @@ impl PromptCacheTracker {
                     for block in arr {
                         let value = self.canonicalize(block);
                         let tokens = estimate_tokens(&value);
-                        let ttl = self.extract_ttl(block);
                         blocks.push(CacheableBlock {
                             value,
                             tokens,
-                            ttl: if ttl > Duration::ZERO {
-                                ttl
-                            } else {
-                                default_ttl
-                            },
+                            ttl: resolve_ttl(block, default_ttl),
                             is_message_end: false,
                         });
                     }
@@ -299,7 +311,8 @@ impl PromptCacheTracker {
             }
         }
 
-        // Messages（只有显式标记 cache_control 的才可缓存）
+        // Messages：默认只有显式标记 cache_control 的才可缓存；
+        // ignore_client_control 开启时消息块也用统一 TTL 生成断点。
         for (i, msg) in messages.iter().enumerate() {
             let content = msg.get("content");
             let _is_last_msg = i == messages.len() - 1;
@@ -308,11 +321,10 @@ impl PromptCacheTracker {
                 Some(serde_json::Value::String(s)) => {
                     let value = self.canonicalize(msg);
                     let tokens = estimate_tokens(s);
-                    let ttl = self.extract_ttl(msg);
                     blocks.push(CacheableBlock {
                         value,
                         tokens,
-                        ttl,
+                        ttl: resolve_ttl(msg, Duration::ZERO),
                         is_message_end: true,
                     });
                 }
@@ -322,11 +334,10 @@ impl PromptCacheTracker {
                         let value = self.canonicalize(block);
                         let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                         let tokens = estimate_tokens(if text.is_empty() { &value } else { text });
-                        let ttl = self.extract_ttl(block);
                         blocks.push(CacheableBlock {
                             value,
                             tokens,
-                            ttl,
+                            ttl: resolve_ttl(block, Duration::ZERO),
                             is_message_end: j == last_idx,
                         });
                     }
@@ -438,6 +449,8 @@ mod tests {
                 None,
                 10_000,
                 "claude-sonnet-4-5-20250929",
+                None,
+                false,
             )
             .expect("system prompt should be cacheable");
 
@@ -445,7 +458,7 @@ mod tests {
         assert_eq!(first.cache_creation_input_tokens, 10_000);
         assert_eq!(first.cache_read_input_tokens, 0);
 
-        tracker.update("account-a", &profile);
+        tracker.update("account-a", &profile, 2000);
 
         let second = tracker.compute("account-a", &profile);
         assert_eq!(second.cache_read_input_tokens, 9_000);
@@ -463,13 +476,128 @@ mod tests {
                 None,
                 10_000,
                 "claude-sonnet-4-5-20250929",
+                None,
+                false,
             )
             .expect("system prompt should be cacheable");
 
-        tracker.update("account-a", &profile);
+        tracker.update("account-a", &profile, 2000);
 
         let usage = tracker.compute_with_target_percent("account-a", &profile, 75);
         assert_eq!(usage.cache_read_input_tokens, 7_500);
         assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn ignore_client_control_caches_unmarked_message() {
+        // 无 cache_control 的长用户消息，在 ignore 模式下也应产生断点并命中
+        let tracker = PromptCacheTracker::new();
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "a".repeat(40_000),
+        })];
+
+        // 关闭 ignore：消息块无标记 → 不缓存 → 无 profile
+        assert!(tracker
+            .build_profile(None, &messages, None, 10_000, "claude-sonnet-4-5", None, false)
+            .is_none());
+
+        // 开启 ignore：统一 TTL 生成断点
+        let profile = tracker
+            .build_profile(None, &messages, None, 10_000, "claude-sonnet-4-5", None, true)
+            .expect("ignore mode should cache unmarked message");
+        tracker.update("account-ic", &profile, 2000);
+        let usage = tracker.compute("account-ic", &profile);
+        assert_eq!(usage.cache_read_input_tokens, 9_000);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn short_ttl_expires_before_next_request() {
+        // 短 TTL 写入后等待超过 TTL，第二次请求应 miss（验证 ttl_override 被真正应用）
+        let tracker = PromptCacheTracker::new();
+        let system = serde_json::Value::String("a".repeat(40_000));
+        let profile = tracker
+            .build_profile(
+                Some(&system),
+                &[],
+                None,
+                10_000,
+                "claude-sonnet-4-5-20250929",
+                Some(Duration::from_millis(20)),
+                false,
+            )
+            .expect("system prompt should be cacheable");
+
+        tracker.update("account-ttl", &profile, 2000);
+        std::thread::sleep(Duration::from_millis(40));
+        // 条目已过期 → 第二次仍是 creation
+        let usage = tracker.compute("account-ttl", &profile);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 10_000);
+    }
+
+    #[test]
+    fn long_ttl_renews_on_hit() {
+        // 长 TTL：写入后立即再次请求应命中（滑动续期）
+        let tracker = PromptCacheTracker::new();
+        let system = serde_json::Value::String("a".repeat(40_000));
+        let profile = tracker
+            .build_profile(
+                Some(&system),
+                &[],
+                None,
+                10_000,
+                "claude-sonnet-4-5-20250929",
+                Some(Duration::from_secs(3600)),
+                false,
+            )
+            .expect("system prompt should be cacheable");
+
+        tracker.update("account-ttl-long", &profile, 2000);
+        let usage = tracker.compute("account-ttl-long", &profile);
+        assert_eq!(usage.cache_read_input_tokens, 9_000);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn max_entries_evicts_oldest() {
+        // max_entries=1 时，插入第二个模型的条目应淘汰最老的
+        let tracker = PromptCacheTracker::new();
+        let sys_a = serde_json::Value::String("a".repeat(40_000));
+        let sys_b = serde_json::Value::String("b".repeat(40_000));
+        // profile_a 用较短 TTL → expires_at 明确更早，淘汰顺序确定
+        let profile_a = tracker
+            .build_profile(
+                Some(&sys_a),
+                &[],
+                None,
+                10_000,
+                "claude-sonnet-4-5",
+                Some(Duration::from_secs(60)),
+                false,
+            )
+            .unwrap();
+        let profile_b = tracker
+            .build_profile(
+                Some(&sys_b),
+                &[],
+                None,
+                10_000,
+                "claude-sonnet-4-5",
+                Some(Duration::from_secs(600)),
+                false,
+            )
+            .unwrap();
+
+        tracker.update("account-cap", &profile_a, 1);
+        tracker.update("account-cap", &profile_b, 1);
+
+        // profile_a 应被淘汰 → miss
+        let usage_a = tracker.compute("account-cap", &profile_a);
+        assert_eq!(usage_a.cache_read_input_tokens, 0);
+        // profile_b 仍在
+        let usage_b = tracker.compute("account-cap", &profile_b);
+        assert_eq!(usage_b.cache_read_input_tokens, 9_000);
     }
 }

@@ -136,6 +136,12 @@ async fn classify_kiro_management_error(api: &str, resp: reqwest::Response) -> S
         if body_lower.contains("suspended") {
             return format!("BANNED: {body}");
         }
+        // 403 + "Invalid token" 是 token 失效（而非封禁/profileArn 权限问题）。
+        // 归为 AUTH_ERROR，让上层刷新流程 refresh token 后自动重试一次；
+        // 若该账号确实无法 refresh，refresh 会失败并如实把账号标为 invalid。
+        if body_lower.contains("invalid token") {
+            return format!("AUTH_ERROR: {api} 403: {body}");
+        }
         return format!("{api} failed - HTTP 403: {body}");
     }
 

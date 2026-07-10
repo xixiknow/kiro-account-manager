@@ -26,6 +26,9 @@ export interface GatewayConfig {
   responseCacheEnabled: boolean;
   responseCacheTtl: number;
   promptCacheTargetPercent: number;
+  promptCacheTtlSecs: number;
+  promptCacheMaxEntries: number;
+  promptCacheIgnoreClientControl: boolean;
 }
 
 export interface ModelMappingRule {
@@ -64,6 +67,22 @@ const normalizePromptCacheTargetPercent = (value: unknown) => {
   return Math.min(100, Math.max(0, Math.round(percent)))
 }
 
+const normalizePromptCacheTtlSecs = (value: unknown) => {
+  const secs = Number(value)
+  if (!Number.isFinite(secs)) {
+    return 300
+  }
+  return Math.min(3600, Math.max(30, Math.round(secs)))
+}
+
+const normalizePromptCacheMaxEntries = (value: unknown) => {
+  const n = Number(value)
+  if (!Number.isFinite(n)) {
+    return 2000
+  }
+  return Math.max(1, Math.round(n))
+}
+
 export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   enabled: false,
   host: '127.0.0.1',
@@ -88,7 +107,10 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {
   logRequests: true,
   responseCacheEnabled: true,
   responseCacheTtl: 180,
-  promptCacheTargetPercent: 90
+  promptCacheTargetPercent: 90,
+  promptCacheTtlSecs: 300,
+  promptCacheMaxEntries: 2000,
+  promptCacheIgnoreClientControl: false
 }
 
 export const DEFAULT_GATEWAY_STATUS: GatewayStatus = {
@@ -124,7 +146,10 @@ export const buildGatewayConfigSnapshot = (config: GatewayConfig) => JSON.string
   logRequests: config.logRequests !== false,
   responseCacheEnabled: !!config.responseCacheEnabled,
   responseCacheTtl: Number(config.responseCacheTtl) || 180,
-  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent)
+  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent),
+  promptCacheTtlSecs: normalizePromptCacheTtlSecs(config.promptCacheTtlSecs),
+  promptCacheMaxEntries: normalizePromptCacheMaxEntries(config.promptCacheMaxEntries),
+  promptCacheIgnoreClientControl: !!config.promptCacheIgnoreClientControl
 })
 
 export const buildGatewayRuntimeSnapshot = (config: GatewayConfig) => JSON.stringify({
@@ -150,7 +175,10 @@ export const buildGatewayRuntimeSnapshot = (config: GatewayConfig) => JSON.strin
   logRequests: config.logRequests !== false,
   responseCacheEnabled: !!config.responseCacheEnabled,
   responseCacheTtl: Number(config.responseCacheTtl) || 180,
-  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent)
+  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent),
+  promptCacheTtlSecs: normalizePromptCacheTtlSecs(config.promptCacheTtlSecs),
+  promptCacheMaxEntries: normalizePromptCacheMaxEntries(config.promptCacheMaxEntries),
+  promptCacheIgnoreClientControl: !!config.promptCacheIgnoreClientControl
 })
 
 export const hydrateGatewayConfig = (gatewayConfig: any): GatewayConfig => ({
@@ -188,7 +216,10 @@ export const hydrateGatewayConfig = (gatewayConfig: any): GatewayConfig => ({
   logRequests: gatewayConfig?.logRequests ?? true,
   responseCacheEnabled: gatewayConfig?.responseCacheEnabled ?? true,
   responseCacheTtl: gatewayConfig?.responseCacheTtl ?? 180,
-  promptCacheTargetPercent: normalizePromptCacheTargetPercent(gatewayConfig?.promptCacheTargetPercent)
+  promptCacheTargetPercent: normalizePromptCacheTargetPercent(gatewayConfig?.promptCacheTargetPercent),
+  promptCacheTtlSecs: normalizePromptCacheTtlSecs(gatewayConfig?.promptCacheTtlSecs),
+  promptCacheMaxEntries: normalizePromptCacheMaxEntries(gatewayConfig?.promptCacheMaxEntries),
+  promptCacheIgnoreClientControl: gatewayConfig?.promptCacheIgnoreClientControl ?? false
 })
 
 export const buildGatewayStatusState = (gatewayStatus: any, gatewayConfig: any, fallbackConfig: GatewayConfig = DEFAULT_GATEWAY_CONFIG): GatewayStatus => ({
@@ -228,7 +259,10 @@ export const buildGatewayPayload = (config: GatewayConfig) => ({
   logRequests: config.logRequests !== false,
   responseCacheEnabled: !!config.responseCacheEnabled,
   responseCacheTtl: Number(config.responseCacheTtl) || 3600,
-  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent)
+  promptCacheTargetPercent: normalizePromptCacheTargetPercent(config.promptCacheTargetPercent),
+  promptCacheTtlSecs: normalizePromptCacheTtlSecs(config.promptCacheTtlSecs),
+  promptCacheMaxEntries: normalizePromptCacheMaxEntries(config.promptCacheMaxEntries),
+  promptCacheIgnoreClientControl: !!config.promptCacheIgnoreClientControl
 })
 
 export const loadGatewayPageData = async () => {

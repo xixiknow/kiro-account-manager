@@ -380,6 +380,34 @@ function GatewayConfig({
                   />
                 </div>
                 <div className="flex flex-col gap-0.5 p-2.5 rounded-lg border border-border bg-muted/30">
+                  <Label className="text-xs text-muted-foreground">{t('gateway.promptCacheTtlSecs')}</Label>
+                  <Input
+                    type="number"
+                    value={config.promptCacheTtlSecs}
+                    min={30}
+                    max={3600}
+                    className="h-6 text-sm px-1.5"
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setField('promptCacheTtlSecs', Number(e.target.value) || 300)}
+                  />
+                </div>
+                <div className="flex flex-col gap-0.5 p-2.5 rounded-lg border border-border bg-muted/30">
+                  <Label className="text-xs text-muted-foreground">{t('gateway.promptCacheMaxEntries')}</Label>
+                  <Input
+                    type="number"
+                    value={config.promptCacheMaxEntries}
+                    min={1}
+                    className="h-6 text-sm px-1.5"
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setField('promptCacheMaxEntries', Number(e.target.value) || 2000)}
+                  />
+                </div>
+                <div className="flex items-center justify-between p-2.5 rounded-lg border border-border bg-muted/30">
+                  <Label className="text-sm">{t('gateway.promptCacheIgnoreClientControl')}</Label>
+                  <Switch
+                    checked={!!config.promptCacheIgnoreClientControl}
+                    onCheckedChange={(checked: boolean) => setField('promptCacheIgnoreClientControl', checked)}
+                  />
+                </div>
+                <div className="flex flex-col gap-0.5 p-2.5 rounded-lg border border-border bg-muted/30">
                   <Label className="text-xs text-muted-foreground">{t('gateway.thresholdPercent')}</Label>
                   <Input
                     type="number"

@@ -168,6 +168,34 @@ export default function GatewayRules() {
                   className="mt-1 h-9"
                 />
               </div>
+              <div>
+                <Label className="text-xs text-muted-foreground">Prompt Cache TTL (秒)</Label>
+                <Input
+                  type="number"
+                  min={30}
+                  max={3600}
+                  value={config.promptCacheTtlSecs}
+                  onChange={(event) => setField('promptCacheTtlSecs', Number(event.target.value) || 300)}
+                  className="mt-1 h-9"
+                />
+              </div>
+              <div>
+                <Label className="text-xs text-muted-foreground">Prompt Cache 最大条目数</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  value={config.promptCacheMaxEntries}
+                  onChange={(event) => setField('promptCacheMaxEntries', Number(event.target.value) || 2000)}
+                  className="mt-1 h-9"
+                />
+              </div>
+              <div className="flex items-center justify-between">
+                <Label className="text-xs text-muted-foreground">忽略客户端 cache_control</Label>
+                <Switch
+                  checked={!!config.promptCacheIgnoreClientControl}
+                  onCheckedChange={(checked) => setField('promptCacheIgnoreClientControl', checked)}
+                />
+              </div>
               <Button variant="outline" className="w-full justify-start gap-2" onClick={() => setShowKeys(true)}>
                 <KeyRound size={15} />
                 管理客户端 Key
