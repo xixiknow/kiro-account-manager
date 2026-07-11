@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { Button } from '@/components/ui/button'
 import {
   DialogRoot,
@@ -34,8 +35,8 @@ export function RouteTestDialog({ open, onOpenChange, config }: RouteTestDialogP
   const handleTest = async () => {
     setIsTesting(true)
     try {
-      // TODO: Implement testRouteConfig function
-      const testResult = { matched_accounts: [], selected_account: null, error: 'Not implemented' } as RouteTestResult
+      // 桌面端走原生 Tauri invoke；server-web 端经 core.ts shim 转发到 /admin/api/invoke/test_route_config
+      const testResult = await invoke<RouteTestResult>('test_route_config', { config })
       setResult(testResult)
       if (testResult.error) {
         toast.error(`${t('gateway.routeTestFailed')}: ${testResult.error}`)

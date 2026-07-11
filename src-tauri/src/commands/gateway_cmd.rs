@@ -495,20 +495,12 @@ pub struct RouteTestResult {
     pub error: Option<String>,
 }
 
-/// 测试路由配置
-#[tauri::command]
-pub async fn test_route_config(
-    state: State<'_, AppState>,
-    config: GatewayConfig,
-) -> Result<RouteTestResult, String> {
-    // 导入 AccountStore
-    use crate::core::account::AccountStore;
-
-    let mut store = AccountStore::new();
-    store.reload();
-
-    // 根据配置筛选账号
-    let matched_accounts = match config.account_mode.as_str() {
+/// 根据 2API 配置从账号库筛选可用账号（不依赖 Tauri State，供桌面端与 server-web 复用）
+pub fn filter_matched_accounts(
+    store: &crate::core::account::AccountStore,
+    config: &GatewayConfig,
+) -> Vec<Account> {
+    match config.account_mode.as_str() {
         "single" => store
             .accounts
             .iter()
@@ -536,7 +528,28 @@ pub async fn test_route_config(
             .cloned()
             .collect::<Vec<_>>(),
         _ => Vec::new(),
-    };
+    }
+}
+
+/// 把匹配/选中的账号渲染成 `label (id)` 展示字符串
+pub fn format_route_account(account: &Account) -> String {
+    format!("{} ({})", account.label, account.id)
+}
+
+/// 测试路由配置
+#[tauri::command]
+pub async fn test_route_config(
+    state: State<'_, AppState>,
+    config: GatewayConfig,
+) -> Result<RouteTestResult, String> {
+    // 导入 AccountStore
+    use crate::core::account::AccountStore;
+
+    let mut store = AccountStore::new();
+    store.reload();
+
+    // 根据配置筛选账号
+    let matched_accounts = filter_matched_accounts(&store, &config);
 
     if matched_accounts.is_empty() {
         return Ok(RouteTestResult {
@@ -560,11 +573,8 @@ pub async fn test_route_config(
     };
 
     Ok(RouteTestResult {
-        matched_accounts: matched_accounts
-            .iter()
-            .map(|acc| format!("{} ({})", acc.label, acc.id))
-            .collect(),
-        selected_account: selected_account.map(|acc| format!("{} ({})", acc.label, acc.id)),
+        matched_accounts: matched_accounts.iter().map(format_route_account).collect(),
+        selected_account: selected_account.as_ref().map(format_route_account),
         error: None,
     })
 }

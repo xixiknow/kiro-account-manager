@@ -2957,6 +2957,53 @@ async fn invoke_command(
                 json_error(StatusCode::NOT_FOUND, "账号不存在")
             }
         }
+        "test_route_config" => {
+            let config_value = payload.get("config").cloned().unwrap_or(payload);
+            let config = match serde_json::from_value::<GatewayConfig>(config_value) {
+                Ok(config) => config,
+                Err(error) => {
+                    return json_error(StatusCode::BAD_REQUEST, format!("无效的网关配置: {error}"))
+                }
+            };
+
+            // 从当前账号库筛选（复用桌面端同一套筛选逻辑）
+            let matched_accounts = {
+                let store = match state.accounts.lock() {
+                    Ok(store) => store,
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "account store lock failed",
+                        )
+                    }
+                };
+                crate::commands::gateway_cmd::filter_matched_accounts(&store, &config)
+            };
+
+            if matched_accounts.is_empty() {
+                return Json(json!({
+                    "matched_accounts": [],
+                    "selected_account": null,
+                    "error": "未找到符合2API配置的可用账号"
+                }))
+                .into_response();
+            }
+
+            // 用运行中的负载均衡器按当前策略选号
+            let selected_account = state.load_balancer.select_account(&matched_accounts).await;
+
+            Json(json!({
+                "matched_accounts": matched_accounts
+                    .iter()
+                    .map(crate::commands::gateway_cmd::format_route_account)
+                    .collect::<Vec<_>>(),
+                "selected_account": selected_account
+                    .as_ref()
+                    .map(crate::commands::gateway_cmd::format_route_account),
+                "error": null
+            }))
+            .into_response()
+        }
         unsupported => json_error(
             StatusCode::NOT_IMPLEMENTED,
             format!("server mode does not support command: {unsupported}"),
